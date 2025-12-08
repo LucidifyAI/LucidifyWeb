@@ -90,8 +90,8 @@ window.addEventListener("resize", () => {
   }
 function buildChannelControls(recording) {
   const n = recording.channels.length;
-  waveformVisible = new Array(n).fill(true);
-  spectrogramVisible = new Array(n).fill(true);
+  waveformVisible = new Array(n).fill(false);
+  spectrogramVisible = new Array(n).fill(false);
 
   waveformControls.innerHTML = "";
   spectrogramControls.innerHTML = "";
@@ -99,12 +99,16 @@ function buildChannelControls(recording) {
   for (let i = 0; i < n; i++) {
     const name = recording.channels[i].name || `Ch ${i + 1}`;
 
+    const defaultVisible = i < 2; // only first two on by default
+    waveformVisible[i] = defaultVisible;
+    spectrogramVisible[i] = defaultVisible;
+
     // Waveform checkbox
     const wLabel = document.createElement("label");
     wLabel.style.marginRight = "0.75rem";
     const wCb = document.createElement("input");
     wCb.type = "checkbox";
-    wCb.checked = true;
+    wCb.checked = defaultVisible;
     wCb.dataset.index = String(i);
     wCb.addEventListener("change", (e) => {
       const idx = Number(e.target.dataset.index);
@@ -122,7 +126,7 @@ function buildChannelControls(recording) {
     sLabel.style.marginRight = "0.75rem";
     const sCb = document.createElement("input");
     sCb.type = "checkbox";
-    sCb.checked = true;
+    sCb.checked = defaultVisible;
     sCb.dataset.index = String(i);
     sCb.addEventListener("change", (e) => {
       const idx = Number(e.target.dataset.index);
@@ -136,6 +140,7 @@ function buildChannelControls(recording) {
     spectrogramControls.appendChild(sLabel);
   }
 }
+
 
   // --- Waveform drawing ------------------------------------------------
 
@@ -443,13 +448,14 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
   }
 
   // Second pass: render into a single imageData
+    // Second pass: render into a single imageData
   const imageData = ctx.createImageData(width, height);
   const data = imageData.data;
 
   for (let ci = 0; ci < nChannels; ci++) {
-	const chIndex = indices[ci];
-    const specRows = specs[chIndex];
-    const nFrames = framesPerChannel[chIndex];
+    const chIndex = indices[ci]; // original channel index (for labels if needed)
+    const specRows = specs[ci];  // use ci here, not chIndex
+    const nFrames = framesPerChannel[ci];
     if (!specRows || nFrames === 0) continue;
 
     const yStart = Math.floor(ci * channelHeight);
@@ -472,8 +478,7 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
 
         let r, g, b;
         if (norm > 1.0) {
-          // clipping → white
-          r = g = b = 255;
+          r = g = b = 255; // clipping => white
         } else {
           [r, g, b] = hotColdColor(norm);
         }
