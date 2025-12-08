@@ -27,9 +27,95 @@ section {
   border-radius: 8px;
 }
 
+/* canvases */
+
 #waveform-canvas,
 #spectrogram-canvas {
   border: 1px solid #444;
   margin-top: 0.5rem;
   width: 100%;
+}
+
+/* waveform + zoom + pan layout */
+
+#waveform-container {
+  margin-top: 0.5rem;
+}
+
+#waveform-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.75rem;
+}
+
+#zoom-column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  width: 48px;
+}
+
+/* new: wrapper that reserves vertical space */
+#zoom-slider-wrapper {
+  height: 180px;                /* adjust as you like */
+  display: flex;
+  align-items: center;          /* center slider vertically */
+  justify-content: center;      /* center slider horizontally */
+}
+
+/* vertical zoom slider itself */
+#zoom-slider {
+  width: 140px;                 /* length of track before rotation */
+  transform: rotate(-90deg);
+  transform-origin: center;
+}
+
+.zoom-label {
+  font-size: 0.8rem;
+  color: #ccc;
+  margin: 0;
+}
+
+/* main waveform area to the right of zoom slider */
+#waveform-main {
+  flex: 1;
+}
+
+/* pan bar under waveform */
+
+#pan-row {
+  margin-top: 0.75rem;
+}
+
+#pan-track {
+  position: relative;
+  height: 16px;
+  background: #333;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+#pan-thumb {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: #888;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+/* labels under waveform / above spectrogram */
+
+#time-label,
+#freq-range-label {
+  font-size: 0.85rem;
+  color: #ccc;
+  margin-top: 0.25rem;
+}
+
+#spectrogram-meta {
+  margin-top: 0.5rem;
+  margin-bottom: 0.25rem;
 }

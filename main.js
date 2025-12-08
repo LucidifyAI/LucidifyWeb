@@ -6,34 +6,136 @@ window.addEventListener("DOMContentLoaded", () => {
 
   const waveformCanvas = document.getElementById("waveform-canvas");
   const waveformCtx = waveformCanvas.getContext("2d");
-
+  
   const spectrogramCanvas = document.getElementById("spectrogram-canvas");
   const spectrogramCtx = spectrogramCanvas.getContext("2d");
-
+  
   const waveformControls = document.getElementById("waveform-controls");
   const spectrogramControls = document.getElementById("spectrogram-controls");
-
+  
+  const zoomSlider = document.getElementById("zoom-slider");
+  const panTrack = document.getElementById("pan-track");
+  const panThumb = document.getElementById("pan-thumb");
+  const timeLabel = document.getElementById("time-label");
+  const freqRangeLabel = document.getElementById("freq-range-label");
+  
+  
+  if (!fileInput || !fileInfo ||
+      !waveformCanvas || !waveformCtx ||
+      !spectrogramCanvas || !spectrogramCtx ||
+      !waveformControls || !spectrogramControls ||
+      !zoomSlider || !panTrack || !panThumb ||
+      !timeLabel || !freqRangeLabel) {
+    console.error("DOM not wired correctly");
+    return;
+  }
+  
+  let spectrogramMaxHz = null;   // null = auto (Nyquist)
+  let editingFreq = false;
+  
+  let lastRecording = null;
+  let waveformVisible = [];
+  let spectrogramVisible = [];
+  
+  // shared view window (seconds)
+  let viewStartSec = 0;
+  let viewDurationSec = 10;
+  let maxViewSpanSec = 60;
+  
+  let isPanning = false;
+  
   if (!fileInput || !fileInfo || !waveformCanvas || !waveformCtx || !spectrogramCanvas || !spectrogramCtx) {
     console.error("DOM not wired correctly");
     return;
   }
-
-function resizeCanvasToDisplaySize(canvas) {
-  const rect = canvas.getBoundingClientRect();
-  const displayWidth = Math.floor(rect.width);
-  if (canvas.width !== displayWidth) {
-    canvas.width = displayWidth;
+ 
+  function resizeCanvasToDisplaySize(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const displayWidth = Math.floor(rect.width);
+    if (canvas.width !== displayWidth) {
+      canvas.width = displayWidth;
+    }
   }
-}
+  freqRangeLabel.addEventListener("click", () => {
+  if (editingFreq) return;
+  if (!lastRecording) return;
+
+  editingFreq = true;
+
+  // current value to show in the input
+  const current = Number.isFinite(spectrogramMaxHz)
+    ? spectrogramMaxHz.toFixed(1)
+    : "";
+
+  // build inline input
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = current;
+  input.size = 6;
+  input.style.background = "#222";
+  input.style.color = "#eee";
+  input.style.border = "1px solid #555";
+  input.style.fontSize = "0.85rem";
+  input.style.marginLeft = "0.25rem";
+  input.style.marginRight = "0.25rem";
+
+  // replace label content with "Freq: 0– [input] Hz"
+  freqRangeLabel.textContent = "Freq: 0–";
+  freqRangeLabel.appendChild(input);
+  const hzSpan = document.createElement("span");
+  hzSpan.textContent = " Hz";
+  freqRangeLabel.appendChild(hzSpan);
+
+  input.focus();
+  input.select();
+
+  function commit() {
+    if (!editingFreq) return;
+    editingFreq = false;
+
+    const val = parseFloat(input.value);
+    const fsForLabel =
+      (lastRecording.channels.find(ch => ch.fs && ch.fs > 0)?.fs) || 256;
+    const nyquist = fsForLabel / 2;
+
+    if (!Number.isFinite(val) || val <= 0) {
+      spectrogramMaxHz = nyquist;     // reset to auto if invalid
+    } else {
+      spectrogramMaxHz = Math.max(1, Math.min(val, nyquist));
+    }
+
+    // redraw; drawSpectrogram will rebuild the label text
+    if (lastRecording) {
+      drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+    }
+  }
+
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      input.blur();
+    } else if (e.key === "Escape") {
+      editingFreq = false;
+      // cancel: reset override to Nyquist
+      spectrogramMaxHz = null;
+      if (lastRecording) {
+        drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+      }
+    }
+  });
+});
 
 window.addEventListener("resize", () => {
   resizeCanvasToDisplaySize(waveformCanvas);
   resizeCanvasToDisplaySize(spectrogramCanvas);
+  updatePanThumb();
   if (lastRecording) {
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
     drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
   }
 });
+
 
   // --- Recording model -------------------------------------------------
   /**
@@ -50,11 +152,6 @@ window.addEventListener("resize", () => {
    */
 
   /** @type {Recording | null} */
-  let lastRecording = null;
-	/** @type {boolean[]} */
-  let waveformVisible = [];
-	/** @type {boolean[]} */
-  let spectrogramVisible = [];
   // Fake test data so we can exercise the renderer
   function createFakeRecording() {
     const durationSec = 10;
@@ -83,10 +180,9 @@ window.addEventListener("resize", () => {
       });
     }
 
-    return {
-      channels,
-      durationSec,
-    };
+	const recording = { durationSec, channels };
+	computeDisplayRanges(recording);
+	return recording;
   }
 function buildChannelControls(recording) {
   const n = recording.channels.length;
@@ -141,7 +237,146 @@ function buildChannelControls(recording) {
   }
 }
 
+function updateTimeLabel() {
+  if (!lastRecording) {
+    timeLabel.textContent = "";
+    return;
+  }
+  const start = viewStartSec;
+  const end = viewStartSec + viewDurationSec;
+  timeLabel.textContent =
+    `Time: ${start.toFixed(1)}–${end.toFixed(1)} s (window ${viewDurationSec.toFixed(1)} s)`;
+}
 
+function updatePanThumb() {
+  if (!lastRecording) {
+    panThumb.style.width = "100%";
+    panThumb.style.left = "0%";
+    return;
+  }
+
+  const spanSec = Math.min(lastRecording.durationSec || 0, maxViewSpanSec);
+  if (spanSec <= 0) {
+    panThumb.style.width = "100%";
+    panThumb.style.left = "0%";
+    return;
+  }
+
+  const windowSec = Math.min(viewDurationSec, spanSec);
+  const fracWidth = windowSec / spanSec;
+
+  if (spanSec <= windowSec || fracWidth >= 0.999) {
+    // fully zoomed out: thumb spans entire track
+    panThumb.style.width = "100%";
+    panThumb.style.left = "0%";
+    return;
+  }
+
+  const maxStart = spanSec - windowSec;
+  const clampedStart = Math.min(Math.max(viewStartSec, 0), maxStart);
+
+  const widthPct = fracWidth * 100;
+  const fracStart = clampedStart / maxStart;
+  const leftPct = fracStart * (100 - widthPct);
+
+  panThumb.style.width = `${widthPct}%`;
+  panThumb.style.left = `${leftPct}%`;
+}
+function updateViewFromZoom() {
+  if (!lastRecording) return;
+
+  const spanSec = Math.min(lastRecording.durationSec || 0, maxViewSpanSec);
+  const minWindowSec = 1;
+  const span = Math.max(minWindowSec, spanSec);
+
+  const zoomVal = Number(zoomSlider.value) || 0; // 0..100
+  const tZoom = zoomVal / 100;
+  viewDurationSec = span - tZoom * (span - minWindowSec);
+
+  const maxStart = Math.max(0, span - viewDurationSec);
+  viewStartSec = Math.min(Math.max(viewStartSec, 0), maxStart);
+
+  updateTimeLabel();
+  updatePanThumb();
+
+  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+}
+
+zoomSlider.addEventListener("input", updateViewFromZoom);
+
+function setViewStartFromPan(clientX) {
+  if (!lastRecording) return;
+
+  const spanSec = Math.min(lastRecording.durationSec || 0, maxViewSpanSec);
+  const minWindowSec = 1;
+  const span = Math.max(minWindowSec, spanSec);
+
+  if (span <= viewDurationSec) {
+    viewStartSec = 0;
+    return;
+  }
+
+  const rect = panTrack.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const fx = Math.min(Math.max(x / rect.width, 0), 1);
+
+  const maxStart = span - viewDurationSec;
+  viewStartSec = fx * maxStart;
+
+  updateTimeLabel();
+  updatePanThumb();
+
+  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+}
+
+panTrack.addEventListener("mousedown", (e) => {
+  isPanning = true;
+  setViewStartFromPan(e.clientX);
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!isPanning) return;
+  setViewStartFromPan(e.clientX);
+});
+
+window.addEventListener("mouseup", () => {
+  isPanning = false;
+});
+function computeDisplayRanges(recording) {
+  if (!recording || !recording.channels) return;
+
+  for (const ch of recording.channels) {
+    const s = ch.samples;
+    if (!s || s.length === 0) {
+      ch.displayMin = -1;
+      ch.displayMax = 1;
+      continue;
+    }
+
+    let minV = Infinity;
+    let maxV = -Infinity;
+
+    // downsample for speed if very long
+    const step = Math.max(1, Math.floor(s.length / 20000));
+    for (let i = 0; i < s.length; i += step) {
+      const v = s[i];
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+
+    if (!Number.isFinite(minV) || !Number.isFinite(maxV) || minV === maxV) {
+      minV = -1;
+      maxV = 1;
+    }
+
+    ch.displayMin = minV;
+    ch.displayMax = maxV;
+  }
+}
+
+//zoomSlider.addEventListener("input", updateViewFromSliders);
   // --- Waveform drawing ------------------------------------------------
 
   /**
@@ -163,11 +398,16 @@ function buildChannelControls(recording) {
 function drawWaveform(ctx, canvas, recording, visible) {
   resizeCanvasToDisplaySize(canvas);
 
-  const { channels } = recording;
+  const { channels, durationSec } = recording;
   if (!channels || channels.length === 0) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     return;
   }
+
+  // effective span we’re using (clamped)
+  const spanSec = Math.min(durationSec, maxViewSpanSec);
+  const startSec = Math.min(viewStartSec, Math.max(0, spanSec - viewDurationSec));
+  const windowSec = Math.min(viewDurationSec, spanSec);
 
   const indices = [];
   for (let i = 0; i < channels.length; i++) {
@@ -193,7 +433,16 @@ function drawWaveform(ctx, canvas, recording, visible) {
     const chIndex = indices[ci];
     const ch = channels[chIndex];
     const samples = ch.samples;
-    const nSamples = samples.length;
+    const fs = ch.fs || 256;
+
+    const totalSpanSamples = Math.min(samples.length, Math.floor(spanSec * fs));
+    const windowSamples = Math.min(Math.floor(windowSec * fs), totalSpanSamples);
+    const startSample = Math.min(Math.floor(startSec * fs), totalSpanSamples - windowSamples);
+
+    if (windowSamples <= 0) continue;
+
+    const seg = samples.subarray(startSample, startSample + windowSamples);
+    const nSamples = seg.length;
 
     const yTop = ci * channelHeight;
     const yMid = yTop + channelHeight / 2;
@@ -208,21 +457,19 @@ function drawWaveform(ctx, canvas, recording, visible) {
     ctx.lineTo(width, yMid);
     ctx.stroke();
 
-    if (nSamples === 0) continue;
+	// use global per-channel range so scale is stable across pan/zoom
+	let minV = ch.displayMin;
+	let maxV = ch.displayMax;
 
-    let minV = Infinity;
-    let maxV = -Infinity;
-    const step = Math.max(1, Math.floor(nSamples / 5000));
-    for (let i = 0; i < nSamples; i += step) {
-      const v = samples[i];
-      if (v < minV) minV = v;
-      if (v > maxV) maxV = v;
-    }
-    if (!Number.isFinite(minV) || !Number.isFinite(maxV)) continue;
+	if (!Number.isFinite(minV) || !Number.isFinite(maxV) || minV === maxV) {
+	  // fallback to a simple +/-1 range if something went wrong
+	  minV = -1;
+	  maxV = 1;
+	}
 
-    const center = 0.5 * (maxV + minV);
-    const halfRange = Math.max((maxV - minV) / 2, 1e-6);
-    const scale = (channelHeight / 2 - padding) / halfRange;
+	const center = 0.5 * (maxV + minV);
+	const halfRange = Math.max((maxV - minV) / 2, 1e-6);
+	const scale = (channelHeight / 2 - padding) / halfRange;
 
     const samplesPerPixel = nSamples / width;
 
@@ -237,7 +484,7 @@ function drawWaveform(ctx, canvas, recording, visible) {
       let localMax = -Infinity;
 
       for (let i = sampleStart; i < sampleEnd && i < nSamples; i++) {
-        const v = samples[i];
+        const v = seg[i];
         if (v < localMin) localMin = v;
         if (v > localMax) localMax = v;
       }
@@ -362,7 +609,7 @@ function hotColdColor(norm) {
 function drawSpectrogram(ctx, canvas, recording, visible) {
   resizeCanvasToDisplaySize(canvas);
 
-  const { channels } = recording;
+  const { channels, durationSec } = recording;
   if (!channels || channels.length === 0) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     return;
@@ -377,6 +624,10 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
     return;
   }
 
+  const spanSec = Math.min(durationSec, maxViewSpanSec);
+  const startSec = Math.min(viewStartSec, Math.max(0, spanSec - viewDurationSec));
+  const windowSec = Math.min(viewDurationSec, spanSec);
+
   const width = canvas.width;
   const height = canvas.height;
   const maxChannelsToDraw = 8;
@@ -384,38 +635,46 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
   const channelHeight = height / nChannels;
 
   const winSize = 512;
-  const hop = winSize >> 2; // 75% overlap
+  const hop = winSize >> 2;
   const nFreq = winSize >> 1;
   const window = hannWindow(winSize);
 
+
   // First pass: compute spectrograms and global min/max
   /** @type {Float32Array[][]} */
-  const specs = new Array(nChannels);
+   const specs = new Array(nChannels);
   const framesPerChannel = new Array(nChannels);
   let globalMin = Infinity;
   let globalMax = -Infinity;
+
+  let fsForLabel = null;
 
   for (let ci = 0; ci < nChannels; ci++) {
     const chIndex = indices[ci];
     const ch = channels[chIndex];
     const fs = ch.fs || 256;
     const samples = ch.samples;
-    const maxDurationSec = 60;
-    const maxSamples = Math.min(samples.length, Math.floor(fs * maxDurationSec));
 
-    if (maxSamples < winSize + 1) {
+    if (fsForLabel == null && fs > 0) {
+      fsForLabel = fs;
+    }
+
+    const totalSpanSamples = Math.min(samples.length, Math.floor(spanSec * fs));
+    const windowSamples = Math.min(Math.floor(windowSec * fs), totalSpanSamples);
+    const startSample = Math.min(Math.floor(startSec * fs), totalSpanSamples - windowSamples);
+
+    if (windowSamples < winSize + 1) {
       specs[ci] = null;
       framesPerChannel[ci] = 0;
       continue;
     }
 
-    const segment = samples.subarray(0, maxSamples);
+    const segment = samples.subarray(startSample, startSample + windowSamples);
     const nFrames = Math.floor((segment.length - winSize) / hop) + 1;
     framesPerChannel[ci] = nFrames;
 
     const re = new Float32Array(winSize);
     const im = new Float32Array(winSize);
-
     const specRows = new Array(nFrames);
 
     for (let f = 0; f < nFrames; f++) {
@@ -442,10 +701,34 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
     specs[ci] = specRows;
   }
 
-  if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax) || globalMin === globalMax) {
-    ctx.clearRect(0, 0, width, height);
-    return;
-  }
+	if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax) || globalMin === globalMax) {
+	  ctx.clearRect(0, 0, width, height);
+	  return;
+	}
+
+	// Nyquist and effective max display freq
+	if (!fsForLabel) fsForLabel = 256;
+	const nyquist = fsForLabel / 2;
+
+	// If override is null or above Nyquist, clamp to Nyquist
+	if (spectrogramMaxHz === null || !Number.isFinite(spectrogramMaxHz) || spectrogramMaxHz <= 0) {
+	  spectrogramMaxHz = nyquist;
+	} else if (spectrogramMaxHz > nyquist) {
+	  spectrogramMaxHz = nyquist;
+	}
+
+	const effectiveMaxHz = spectrogramMaxHz;
+	freqRangeLabel.textContent = `Freq: 0–${effectiveMaxHz.toFixed(1)} Hz`;
+
+	// Precompute the highest bin we will show
+	const maxBin = Math.max(
+	  1,
+	  Math.min(
+		nFreq - 1,
+		Math.floor((effectiveMaxHz / nyquist) * (nFreq - 1))
+	  )
+	);
+
 
   // Second pass: render into a single imageData
     // Second pass: render into a single imageData
@@ -465,8 +748,11 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
       const y = yStart + yLocal;
       if (y >= height) break;
 
-      const freqFrac = 1 - yLocal / Math.max(1, chHeight - 1);
-      const freqIndex = Math.min(nFreq - 1, Math.floor(freqFrac * nFreq));
+	const freqFrac = 1 - yLocal / Math.max(1, chHeight - 1);
+	const freqIndex = Math.min(
+	  maxBin,
+	  Math.floor(freqFrac * maxBin)
+	);
 
       for (let x = 0; x < width; x++) {
         const tFrac = x / Math.max(1, width - 1);
@@ -642,10 +928,13 @@ function parseEdf(buffer) {
   console.log("EDF parsed: channels =", channels.length,
               "durationSec =", durationSec);
 
-  return {
-    channels,
-    durationSec,
-  };
+	const recording = {
+	  durationSec,
+	  channels
+	};
+
+	computeDisplayRanges(recording);
+	return recording;
 }
 
 
@@ -682,14 +971,38 @@ function parseEdf(buffer) {
 		if (name.endsWith(".edf")) {
 		  lastRecording = parseEdf(arrayBuffer);
 		  buildChannelControls(lastRecording);
+		  maxViewSpanSec = Math.min(lastRecording.durationSec || 0, 60);
+		if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
+   		  viewStartSec = 0;
+   		  viewDurationSec = maxViewSpanSec;
+   
+     		  // reset sliders
+   		  zoomSlider.value = "0";
+   		  updateTimeLabel();
 		  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
 		  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
 		} else {
 		  console.warn("Unknown format, using fake data for now");
-		  lastRecording = createFakeRecording();
+          lastRecording = createFakeRecording();
+		  maxViewSpanSec = Math.min(lastRecording.durationSec || 0, 60);
+		  viewStartSec = 0;
+		  viewDurationSec = maxViewSpanSec;
+		  zoomSlider.value = "0";
+		  updateTimeLabel();
 		  buildChannelControls(lastRecording);
-		  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-		  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+          maxViewSpanSec = Math.min(lastRecording.durationSec || 0, 60);
+          if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
+          
+          viewStartSec = 0;
+          viewDurationSec = maxViewSpanSec;
+          
+          // reset zoom to “full”
+          zoomSlider.value = "0";
+          updateTimeLabel();
+          updatePanThumb();
+          
+          drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+          drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
 		}
 
 		console.log("Parsed recording:", lastRecording);

@@ -23,17 +23,41 @@
     </section>
 
 	<section id="views">
-	  <h2>Views</h2>
-	  <p>(Waveform / spectrogram / histogram will go here.)</p>
+	<h2>Views</h2>
+	<p>(Waveform / spectrogram / histogram will go here.)</p>
+	
+	<div id="waveform-container">
+		<div id="waveform-row">
+		<div id="zoom-column">
+		  <div id="zoom-slider-wrapper">
+			<input type="range" id="zoom-slider" min="0" max="100" value="0" />
+		  </div>
+		  <div class="zoom-label">Zoom</div>
+		</div>
 
-	  <h3>Waveform</h3>
-	  <div id="waveform-controls"></div>
-	  <canvas id="waveform-canvas" width="800" height="240"></canvas>
-
-	  <h3>Spectrogram</h3>
-	  <div id="spectrogram-controls"></div>
-	  <canvas id="spectrogram-canvas" width="800" height="240"></canvas>
+		<div id="waveform-main">
+			<h3>Waveform</h3>
+			<div id="waveform-controls"></div>
+			<canvas id="waveform-canvas" width="800" height="240"></canvas>
+		</div>
+		</div>
+	
+		<div id="pan-row">
+		<div id="pan-track">
+			<div id="pan-thumb"></div>
+		</div>
+		<div id="time-label"></div>
+		</div>
+	</div>
+	
+	<h3>Spectrogram</h3>
+	<div id="spectrogram-meta">
+		<span id="freq-range-label"></span>
+	</div>
+	<div id="spectrogram-controls"></div>
+	<canvas id="spectrogram-canvas" width="800" height="240"></canvas>
 	</section>
+
   </main>
 
   <script src="main.js"></script>
