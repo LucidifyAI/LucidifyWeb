@@ -62,30 +62,20 @@ window.addEventListener("DOMContentLoaded", () => {
 
   editingFreq = true;
 
-  // current value to show in the input
-  const current = Number.isFinite(spectrogramMaxHz)
-    ? spectrogramMaxHz.toFixed(1)
-    : "";
+  // current text, e.g. "Freq: 0–256.0 Hz"
+  const text = freqRangeLabel.textContent || "";
+  const match = text.match(/0–\s*([\d.]+)\s*Hz/);
+  const currentHz = match ? match[1] : "";
 
-  // build inline input
-  const input = document.createElement("input");
-  input.type = "text";
-  input.value = current;
-  input.size = 6;
-  input.style.background = "#222";
-  input.style.color = "#eee";
-  input.style.border = "1px solid #555";
-  input.style.fontSize = "0.85rem";
-  input.style.marginLeft = "0.25rem";
-  input.style.marginRight = "0.25rem";
+  // Inline editor: Freq: 0– [input] Hz
+  freqRangeLabel.innerHTML =
+    'Freq: 0– <input id="freqEdit" type="number" step="1" ' +
+    'style="width:70px;background:#222;color:#eee;' +
+    'border:1px solid #555;font-size:0.85rem;"> Hz';
 
-  // replace label content with "Freq: 0– [input] Hz"
-  freqRangeLabel.textContent = "Freq: 0–";
-  freqRangeLabel.appendChild(input);
-  const hzSpan = document.createElement("span");
-  hzSpan.textContent = " Hz";
-  freqRangeLabel.appendChild(hzSpan);
-
+  /** @type {HTMLInputElement} */
+  const input = document.getElementById("freqEdit");
+  input.value = currentHz;
   input.focus();
   input.select();
 
@@ -93,20 +83,31 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!editingFreq) return;
     editingFreq = false;
 
+    // derive Nyquist from first channel with fs, fallback 256
+    const chWithFs = lastRecording.channels.find(ch => ch.fs && ch.fs > 0);
+    const fs = chWithFs ? chWithFs.fs : 256;
+    const nyquist = fs / 2;
+
     const val = parseFloat(input.value);
-    const fsForLabel =
-      (lastRecording.channels.find(ch => ch.fs && ch.fs > 0)?.fs) || 256;
-    const nyquist = fsForLabel / 2;
 
     if (!Number.isFinite(val) || val <= 0) {
-      spectrogramMaxHz = nyquist;     // reset to auto if invalid
+      spectrogramMaxHz = nyquist;                  // reset to Nyquist
     } else {
-      spectrogramMaxHz = Math.max(1, Math.min(val, nyquist));
+      spectrogramMaxHz = Math.min(Math.max(val, 1), nyquist);
     }
 
-    // redraw; drawSpectrogram will rebuild the label text
+    // restore plain label; drawSpectrogram will not overwrite it while editingFreq is false
+    freqRangeLabel.textContent =
+      `Freq: 0–${spectrogramMaxHz.toFixed(1)} Hz`;
+
+    // redraw with new limit
     if (lastRecording) {
-      drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+      drawSpectrogram(
+        spectrogramCtx,
+        spectrogramCanvas,
+        lastRecording,
+        spectrogramVisible
+      );
     }
   }
 
@@ -114,14 +115,17 @@ window.addEventListener("DOMContentLoaded", () => {
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      input.blur();
+      input.blur();   // triggers commit()
     } else if (e.key === "Escape") {
+      // cancel: restore label based on current spectrogramMaxHz
       editingFreq = false;
-      // cancel: reset override to Nyquist
-      spectrogramMaxHz = null;
-      if (lastRecording) {
-        drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-      }
+      const chWithFs = lastRecording.channels.find(ch => ch.fs && ch.fs > 0);
+      const fs = chWithFs ? chWithFs.fs : 256;
+      const nyquist = fs / 2;
+      const eff = (!Number.isFinite(spectrogramMaxHz) || spectrogramMaxHz <= 0)
+        ? nyquist
+        : Math.min(spectrogramMaxHz, nyquist);
+      freqRangeLabel.textContent = `Freq: 0–${eff.toFixed(1)} Hz`;
     }
   });
 });
@@ -718,7 +722,9 @@ function drawSpectrogram(ctx, canvas, recording, visible) {
 	}
 
 	const effectiveMaxHz = spectrogramMaxHz;
-	freqRangeLabel.textContent = `Freq: 0–${effectiveMaxHz.toFixed(1)} Hz`;
+	if (!editingFreq) {
+		freqRangeLabel.textContent = `Freq: 0–${effectiveMaxHz.toFixed(1)} Hz`;
+	}
 
 	// Precompute the highest bin we will show
 	const maxBin = Math.max(
