@@ -977,7 +977,8 @@ function parseEdf(buffer) {
 		if (name.endsWith(".edf")) {
 		  lastRecording = parseEdf(arrayBuffer);
 		  buildChannelControls(lastRecording);
-		  maxViewSpanSec = Math.min(lastRecording.durationSec || 0, 60);
+		  maxViewSpanSec = lastRecording.durationSec || 10;
+		  if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
 		if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
    		  viewStartSec = 0;
    		  viewDurationSec = maxViewSpanSec;
@@ -996,8 +997,8 @@ function parseEdf(buffer) {
 		  zoomSlider.value = "0";
 		  updateTimeLabel();
 		  buildChannelControls(lastRecording);
-          maxViewSpanSec = Math.min(lastRecording.durationSec || 0, 60);
-          if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
+		  maxViewSpanSec = lastRecording.durationSec || 10;
+		  if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
           
           viewStartSec = 0;
           viewDurationSec = maxViewSpanSec;
