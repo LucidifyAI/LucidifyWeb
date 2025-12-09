@@ -19,6 +19,23 @@ window.addEventListener("DOMContentLoaded", () => {
   const timeLabel = document.getElementById("time-label");
   const freqRangeLabel = document.getElementById("freq-range-label");
   
+  const LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024; // 50 MB, tweak as needed
+  
+  // Optional large-file segment loader (from large_edf_segment_loader.js)
+  const segmentLoader = window.LargeEdfSegmentLoader
+    ? new window.LargeEdfSegmentLoader({
+        thresholdBytes: LARGE_FILE_THRESHOLD_BYTES,
+        onSegmentReady: (recording) => {
+          fileInfo.textContent = "Loaded EDF segment.";
+          useRecording(recording);
+        },
+        onCancelled: (reason) => {
+          console.log("Large EDF segment load cancelled/failed:", reason);
+          fileInfo.textContent = "Large EDF load cancelled.";
+        }
+      })
+    : null;
+
   
   if (!fileInput || !fileInfo ||
       !waveformCanvas || !waveformCtx ||
@@ -140,6 +157,59 @@ window.addEventListener("resize", () => {
   }
 });
 
+  /**
+   * Given a full Recording and a selection
+   *   { startSec, durationSec, channelIndices }
+   * return a new, smaller Recording containing only those channels and
+   * only that time window. Recomputes display ranges on the result.
+   */
+  function sliceRecordingToSelection(recording, selection) {
+    if (!recording || !selection) return recording;
+
+    const { startSec, durationSec, channelIndices } = selection;
+    if (!Array.isArray(channelIndices) || channelIndices.length === 0) {
+      return recording;
+    }
+
+    const outChannels = [];
+    let outDuration = 0;
+
+    for (const idx of channelIndices) {
+      const ch = recording.channels[idx];
+      if (!ch || !ch.samples) continue;
+
+      const fs = ch.fs || 256;
+      const startSample = Math.max(0, Math.floor(startSec * fs));
+      const endSample = Math.min(
+        ch.samples.length,
+        Math.floor((startSec + durationSec) * fs)
+      );
+      if (endSample <= startSample) continue;
+
+      const sliced = ch.samples.subarray(startSample, endSample);
+      const chDuration = (endSample - startSample) / fs;
+      if (chDuration > outDuration) outDuration = chDuration;
+
+      outChannels.push({
+        name: ch.name,
+        fs,
+        samples: sliced
+      });
+    }
+
+    if (outChannels.length === 0) {
+      // Fallback: nothing selected or bad selection, keep original
+      return recording;
+    }
+
+    const slim = {
+      channels: outChannels,
+      durationSec: outDuration
+    };
+
+    computeDisplayRanges(slim);
+    return slim;
+  }
 
   // --- Recording model -------------------------------------------------
   /**
@@ -348,6 +418,36 @@ window.addEventListener("mousemove", (e) => {
 window.addEventListener("mouseup", () => {
   isPanning = false;
 });
+
+  function useRecording(recording) {
+    lastRecording = recording;
+    if (!lastRecording || !lastRecording.channels || lastRecording.channels.length === 0) {
+      fileInfo.textContent = "No data in recording.";
+      waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+      spectrogramCtx.clearRect(0, 0, spectrogramCanvas.width, spectrogramCanvas.height);
+      waveformControls.innerHTML = "";
+      spectrogramControls.innerHTML = "";
+      timeLabel.textContent = "";
+      updatePanThumb();
+      return;
+    }
+
+    buildChannelControls(lastRecording);
+
+    maxViewSpanSec = lastRecording.durationSec || 10;
+    if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
+
+    viewStartSec = 0;
+    viewDurationSec = maxViewSpanSec;
+
+    zoomSlider.value = "0";
+    updateTimeLabel();
+    updatePanThumb();
+
+    drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+    drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+  }
+
 function computeDisplayRanges(recording) {
   if (!recording || !recording.channels) return;
 
@@ -943,83 +1043,65 @@ function parseEdf(buffer) {
 	return recording;
 }
 
-
-  // --- File handling ---------------------------------------------------
+window.LucidifyParseEdf = parseEdf;
+    // --- File handling ---------------------------------------------------
 
   fileInput.addEventListener("change", (event) => {
     const input = event.target;
     if (!input.files || input.files.length === 0) {
       fileInfo.textContent = "No file selected.";
-	lastRecording = null;
-	waveformVisible = [];
-	spectrogramVisible = [];
-	waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
-	spectrogramCtx.clearRect(0, 0, spectrogramCanvas.width, spectrogramCanvas.height);
-	waveformControls.innerHTML = "";
-	spectrogramControls.innerHTML = "";
+      lastRecording = null;
+      waveformVisible = [];
+      spectrogramVisible = [];
+      waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+      spectrogramCtx.clearRect(0, 0, spectrogramCanvas.width, spectrogramCanvas.height);
+      waveformControls.innerHTML = "";
+      spectrogramControls.innerHTML = "";
+      timeLabel.textContent = "";
+      updatePanThumb();
       return;
     }
 
     const file = input.files[0];
-    fileInfo.textContent = `Selected: ${file.name} (${file.size} bytes)`;
+    const nameLower = (file.name || "").toLowerCase();
 
+    fileInfo.textContent = `Selected: ${file.name} (${file.size} bytes)`;
     console.log("Selected file:", file);
 
+    // Let the large-file segment loader intercept big EDFs
+    if (
+      segmentLoader &&
+      nameLower.endsWith(".edf") &&
+      file.size >= LARGE_FILE_THRESHOLD_BYTES
+    ) {
+      const handled = segmentLoader.handleFile(file);
+      if (handled) {
+        // LargeEdfSegmentLoader will show its own UI and call onSegmentReady
+        return;
+      }
+    }
+
     const reader = new FileReader();
-	reader.onload = () => {
-	  const arrayBuffer = reader.result;
-	  const bytes = new Uint8Array(arrayBuffer);
-	  console.log("File loaded, first 64 bytes:", bytes.slice(0, 64));
 
-	  try {
-		// Simple extension check for now
-		const name = (file.name || "").toLowerCase();
-		if (name.endsWith(".edf")) {
-		  lastRecording = parseEdf(arrayBuffer);
-		  buildChannelControls(lastRecording);
-		  maxViewSpanSec = lastRecording.durationSec || 10;
-		  if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
-		if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
-   		  viewStartSec = 0;
-   		  viewDurationSec = maxViewSpanSec;
-   
-     		  // reset sliders
-   		  zoomSlider.value = "0";
-   		  updateTimeLabel();
-		  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-		  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-		} else {
-		  console.warn("Unknown format, using fake data for now");
-          lastRecording = createFakeRecording();
-		  maxViewSpanSec = Math.min(lastRecording.durationSec || 0, 60);
-		  viewStartSec = 0;
-		  viewDurationSec = maxViewSpanSec;
-		  zoomSlider.value = "0";
-		  updateTimeLabel();
-		  buildChannelControls(lastRecording);
-		  maxViewSpanSec = lastRecording.durationSec || 10;
-		  if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
-          
-          viewStartSec = 0;
-          viewDurationSec = maxViewSpanSec;
-          
-          // reset zoom to “full”
-          zoomSlider.value = "0";
-          updateTimeLabel();
-          updatePanThumb();
-          
-          drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-          drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-		}
+    reader.onload = () => {
+      const arrayBuffer = reader.result;
+      const bytes = new Uint8Array(arrayBuffer);
+      console.log("File loaded, first 64 bytes:", bytes.slice(0, 64));
 
-		console.log("Parsed recording:", lastRecording);
-		drawWaveform(waveformCtx, waveformCanvas, lastRecording,waveformVisible);
-		drawSpectrogram(spectrogramCtx,spectrogramCanvas,lastRecording,spectrogramVisible);
-	  } catch (err) {
-		console.error("Error parsing EDF:", err);
-		fileInfo.textContent = "Error parsing EDF file.";
-	  }
-	};
+      try {
+        if (nameLower.endsWith(".edf")) {
+          const recording = parseEdf(arrayBuffer);
+          useRecording(recording);
+        } else {
+          console.warn("Unknown format, using fake data for now");
+          const recording = createFakeRecording();
+          useRecording(recording);
+        }
+      } catch (err) {
+        console.error("Error parsing EDF:", err);
+        fileInfo.textContent = "Error parsing EDF file.";
+      }
+    };
 
     reader.onerror = (err) => {
       console.error("Error reading file", err);
@@ -1029,8 +1111,11 @@ function parseEdf(buffer) {
     reader.readAsArrayBuffer(file);
   });
 
+
+
   // Initial dummy drawing so we see something
   lastRecording = createFakeRecording();
   drawWaveform(waveformCtx, waveformCanvas, lastRecording);
   drawSpectrogram(spectrogramCtx,spectrogramCanvas,lastRecording);
 });
+
