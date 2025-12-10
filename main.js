@@ -1,3 +1,19 @@
+/*
+ Lucidify EDF Tools - Copyright (c) 2025 Lucidify
+ All rights reserved.
+
+ This source code is provided for use only within the Lucidify platform
+ and associated research tools. Redistribution, reproduction, or use of
+ any portion of this file outside Lucidify projects is not permitted
+ without written permission.
+
+ The algorithms and methods implemented here represent proprietary work
+ under active development. Unauthorized reuse may violate copyright or
+ research licensing agreements.
+
+ If you need access, licensing, or integration support, contact:
+ support@lucidify.ai
+*/
 console.log("Lucidify EEG Viewer starting…");
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -21,6 +37,7 @@ window.addEventListener("DOMContentLoaded", () => {
   
   const LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024; // 50 MB, tweak as needed
   
+  const saveViewButton = document.getElementById("save-view-button");
   // Optional large-file segment loader (from large_edf_segment_loader.js)
   const segmentLoader = window.LargeEdfSegmentLoader
     ? new window.LargeEdfSegmentLoader({
@@ -51,6 +68,7 @@ window.addEventListener("DOMContentLoaded", () => {
   let editingFreq = false;
   
   let lastRecording = null;
+  let lastFileName = null; 
   let waveformVisible = [];
   let spectrogramVisible = [];
   
@@ -61,367 +79,324 @@ window.addEventListener("DOMContentLoaded", () => {
   
   let isPanning = false;
   
+  
+
+  // Bind EDF parser and renderers from separate modules
+  const parseEdf = window.LucidifyParseEdf;
+  const createFakeRecording = window.LucidifyCreateFakeRecording;
+  const drawWaveform = window.LucidifyDrawWaveform;
+  const drawSpectrogram = window.LucidifyDrawSpectrogram;
+  const resizeCanvasToDisplaySize = window.LucidifyResizeCanvasToDisplaySize;
+
+  if (window.LucidifyBindRenderViewState) {
+    window.LucidifyBindRenderViewState({
+      maxViewSpanSecRef:   { get value() { return maxViewSpanSec; },   set value(v) { maxViewSpanSec = v; } },
+      viewStartSecRef:     { get value() { return viewStartSec; },     set value(v) { viewStartSec = v; } },
+      viewDurationSecRef:  { get value() { return viewDurationSec; },  set value(v) { viewDurationSec = v; } },
+      spectrogramMaxHzRef: { get value() { return spectrogramMaxHz; }, set value(v) { spectrogramMaxHz = v; } },
+      editingFreqRef:      { get value() { return editingFreq; },      set value(v) { editingFreq = v; } },
+      freqRangeLabelRef:   { get value() { return freqRangeLabel; } },
+    });
+  }
+
   if (!fileInput || !fileInfo || !waveformCanvas || !waveformCtx || !spectrogramCanvas || !spectrogramCtx) {
     console.error("DOM not wired correctly");
     return;
   }
- 
-  function resizeCanvasToDisplaySize(canvas) {
-    const rect = canvas.getBoundingClientRect();
-    const displayWidth = Math.floor(rect.width);
-    if (canvas.width !== displayWidth) {
-      canvas.width = displayWidth;
+  
+  // --- UI / state helpers ------------------------------------------------
+
+  function updateTimeLabel() {
+    if (!lastRecording) {
+      timeLabel.textContent = "";
+      return;
     }
-  }
-  freqRangeLabel.addEventListener("click", () => {
-  if (editingFreq) return;
-  if (!lastRecording) return;
-
-  editingFreq = true;
-
-  // current text, e.g. "Freq: 0–256.0 Hz"
-  const text = freqRangeLabel.textContent || "";
-  const match = text.match(/0–\s*([\d.]+)\s*Hz/);
-  const currentHz = match ? match[1] : "";
-
-  // Inline editor: Freq: 0– [input] Hz
-  freqRangeLabel.innerHTML =
-    'Freq: 0– <input id="freqEdit" type="number" step="1" ' +
-    'style="width:70px;background:#222;color:#eee;' +
-    'border:1px solid #555;font-size:0.85rem;"> Hz';
-
-  /** @type {HTMLInputElement} */
-  const input = document.getElementById("freqEdit");
-  input.value = currentHz;
-  input.focus();
-  input.select();
-
-  function commit() {
-    if (!editingFreq) return;
-    editingFreq = false;
-
-    // derive Nyquist from first channel with fs, fallback 256
-    const chWithFs = lastRecording.channels.find(ch => ch.fs && ch.fs > 0);
-    const fs = chWithFs ? chWithFs.fs : 256;
-    const nyquist = fs / 2;
-
-    const val = parseFloat(input.value);
-
-    if (!Number.isFinite(val) || val <= 0) {
-      spectrogramMaxHz = nyquist;                  // reset to Nyquist
-    } else {
-      spectrogramMaxHz = Math.min(Math.max(val, 1), nyquist);
-    }
-
-    // restore plain label; drawSpectrogram will not overwrite it while editingFreq is false
-    freqRangeLabel.textContent =
-      `Freq: 0–${spectrogramMaxHz.toFixed(1)} Hz`;
-
-    // redraw with new limit
-    if (lastRecording) {
-      drawSpectrogram(
-        spectrogramCtx,
-        spectrogramCanvas,
-        lastRecording,
-        spectrogramVisible
-      );
-    }
+    const end = viewStartSec + viewDurationSec;
+    timeLabel.textContent =
+      `Time: ${viewStartSec.toFixed(2)}–${end.toFixed(2)} s / ` +
+      `${lastRecording.durationSec.toFixed(2)} s`;
   }
 
-  input.addEventListener("blur", commit);
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      input.blur();   // triggers commit()
-    } else if (e.key === "Escape") {
-      // cancel: restore label based on current spectrogramMaxHz
-      editingFreq = false;
-      const chWithFs = lastRecording.channels.find(ch => ch.fs && ch.fs > 0);
-      const fs = chWithFs ? chWithFs.fs : 256;
-      const nyquist = fs / 2;
-      const eff = (!Number.isFinite(spectrogramMaxHz) || spectrogramMaxHz <= 0)
-        ? nyquist
-        : Math.min(spectrogramMaxHz, nyquist);
-      freqRangeLabel.textContent = `Freq: 0–${eff.toFixed(1)} Hz`;
-    }
-  });
-});
+  // Pan thumb reflects which portion of the recording we’re viewing.
+  function updatePanThumb() {
+    if (!lastRecording || !panTrack) return;
+    const trackRect = panTrack.getBoundingClientRect();
+    const trackWidth = trackRect.width;
+    if (trackWidth <= 0) return;
 
-window.addEventListener("resize", () => {
-  resizeCanvasToDisplaySize(waveformCanvas);
-  resizeCanvasToDisplaySize(spectrogramCanvas);
-  updatePanThumb();
-  if (lastRecording) {
+    const duration = lastRecording.durationSec || 1;
+    const span = Math.min(duration, maxViewSpanSec);
+    const windowSpan = Math.min(viewDurationSec, span);
+
+    if (span <= 0 || windowSpan <= 0) {
+      panThumb.style.width = "0px";
+      panThumb.style.transform = "translateX(0px)";
+      return;
+    }
+
+    const ratio = windowSpan / span;
+    const thumbWidth = Math.max(10, trackWidth * ratio);
+
+    const clampedStart = Math.max(0, Math.min(viewStartSec, span - windowSpan));
+    const posRatio = clampedStart / span;
+    const x = (trackWidth - thumbWidth) * posRatio;
+
+    panThumb.style.width = `${thumbWidth}px`;
+    panThumb.style.transform = `translateX(${x}px)`;
+  }
+
+  // If the user drags the pan thumb, we reposition the view window.
+  function panToFraction(frac) {
+    if (!lastRecording) return;
+    frac = Math.min(Math.max(frac, 0), 1);
+
+    const duration = lastRecording.durationSec || 1;
+    const span = Math.min(duration, maxViewSpanSec);
+    const windowSpan = Math.min(viewDurationSec, span);
+    if (span <= 0 || windowSpan <= 0) return;
+
+    const maxStart = span - windowSpan;
+    viewStartSec = frac * maxStart;
+
+    updateTimeLabel();
+    updatePanThumb();
+
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
     drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
   }
-});
+
+  // --- Channel visibility controls --------------------------------------
 
   /**
-   * Given a full Recording and a selection
-   *   { startSec, durationSec, channelIndices }
-   * return a new, smaller Recording containing only those channels and
-   * only that time window. Recomputes display ranges on the result.
+   * Rebuild the checkboxes for wave/spectrogram visibility.
+   * @param {Recording} recording
    */
-  function sliceRecordingToSelection(recording, selection) {
-    if (!recording || !selection) return recording;
-
-    const { startSec, durationSec, channelIndices } = selection;
-    if (!Array.isArray(channelIndices) || channelIndices.length === 0) {
-      return recording;
-    }
-
-    const outChannels = [];
-    let outDuration = 0;
-
-    for (const idx of channelIndices) {
-      const ch = recording.channels[idx];
-      if (!ch || !ch.samples) continue;
-
-      const fs = ch.fs || 256;
-      const startSample = Math.max(0, Math.floor(startSec * fs));
-      const endSample = Math.min(
-        ch.samples.length,
-        Math.floor((startSec + durationSec) * fs)
-      );
-      if (endSample <= startSample) continue;
-
-      const sliced = ch.samples.subarray(startSample, endSample);
-      const chDuration = (endSample - startSample) / fs;
-      if (chDuration > outDuration) outDuration = chDuration;
-
-      outChannels.push({
-        name: ch.name,
-        fs,
-        samples: sliced
-      });
-    }
-
-    if (outChannels.length === 0) {
-      // Fallback: nothing selected or bad selection, keep original
-      return recording;
-    }
-
-    const slim = {
-      channels: outChannels,
-      durationSec: outDuration
-    };
-
-    computeDisplayRanges(slim);
-    return slim;
-  }
-
-  // --- Recording model -------------------------------------------------
-  /**
-   * @typedef {Object} Channel
-   * @property {string} name
-   * @property {number} fs         // sampling rate (Hz)
-   * @property {Float32Array} samples
-   */
-
-  /**
-   * @typedef {Object} Recording
-   * @property {Channel[]} channels
-   * @property {number} durationSec
-   */
-
-  /** @type {Recording | null} */
-  // Fake test data so we can exercise the renderer
-  function createFakeRecording() {
-    const durationSec = 10;
-    const fs = 256;
-    const nSamples = durationSec * fs;
-
-    /** @type {Channel[]} */
-    const channels = [];
-
-    const freqs = [8, 12, 4]; // pretend alpha, beta, theta, etc.
-    const names = ["Cz", "Pz", "F3"];
-
-    for (let ch = 0; ch < names.length; ch++) {
-      const samples = new Float32Array(nSamples);
-      const f = freqs[ch % freqs.length];
-      for (let i = 0; i < nSamples; i++) {
-        const t = i / fs;
-        const sine = Math.sin(2 * Math.PI * f * t);
-        const noise = (Math.random() - 0.5) * 0.3;
-        samples[i] = sine + noise;
-      }
-      channels.push({
-        name: names[ch],
-        fs,
-        samples,
-      });
-    }
-
-	const recording = { durationSec, channels };
-	computeDisplayRanges(recording);
-	return recording;
-  }
 function buildChannelControls(recording) {
-  const n = recording.channels.length;
-  waveformVisible = new Array(n).fill(false);
-  spectrogramVisible = new Array(n).fill(false);
-
   waveformControls.innerHTML = "";
   spectrogramControls.innerHTML = "";
 
-  for (let i = 0; i < n; i++) {
-    const name = recording.channels[i].name || `Ch ${i + 1}`;
+  const channels = recording.channels || [];
+  const n = channels.length;
 
-    const defaultVisible = i < 2; // only first two on by default
-    waveformVisible[i] = defaultVisible;
-    spectrogramVisible[i] = defaultVisible;
+  // Start with all channels OFF…
+  waveformVisible = new Array(n).fill(false);
+  spectrogramVisible = new Array(n).fill(false);
 
-    // Waveform checkbox
+  channels.forEach((ch, idx) => {
+    const name = ch.name || `Ch ${idx + 1}`;
+
+    // Only the first two channels visible initially
+    const defaultVisible = idx < 2;
+    waveformVisible[idx] = defaultVisible;
+    spectrogramVisible[idx] = defaultVisible;
+
+    // --- Waveform checkbox ---
     const wLabel = document.createElement("label");
-    wLabel.style.marginRight = "0.75rem";
     const wCb = document.createElement("input");
     wCb.type = "checkbox";
     wCb.checked = defaultVisible;
-    wCb.dataset.index = String(i);
     wCb.addEventListener("change", (e) => {
-      const idx = Number(e.target.dataset.index);
       waveformVisible[idx] = e.target.checked;
       if (lastRecording) {
-        drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+        drawWaveform(
+          waveformCtx,
+          waveformCanvas,
+          lastRecording,
+          waveformVisible
+        );
       }
     });
     wLabel.appendChild(wCb);
     wLabel.appendChild(document.createTextNode(" " + name));
     waveformControls.appendChild(wLabel);
+    waveformControls.appendChild(document.createElement("br"));
 
-    // Spectrogram checkbox
+    // --- Spectrogram checkbox ---
     const sLabel = document.createElement("label");
-    sLabel.style.marginRight = "0.75rem";
     const sCb = document.createElement("input");
     sCb.type = "checkbox";
     sCb.checked = defaultVisible;
-    sCb.dataset.index = String(i);
     sCb.addEventListener("change", (e) => {
-      const idx = Number(e.target.dataset.index);
       spectrogramVisible[idx] = e.target.checked;
       if (lastRecording) {
-        drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+        drawSpectrogram(
+          spectrogramCtx,
+          spectrogramCanvas,
+          lastRecording,
+          spectrogramVisible
+        );
       }
     });
     sLabel.appendChild(sCb);
     sLabel.appendChild(document.createTextNode(" " + name));
     spectrogramControls.appendChild(sLabel);
-  }
+    spectrogramControls.appendChild(document.createElement("br"));
+  });
 }
 
-function updateTimeLabel() {
-  if (!lastRecording) {
-    timeLabel.textContent = "";
-    return;
-  }
-  const start = viewStartSec;
-  const end = viewStartSec + viewDurationSec;
-  timeLabel.textContent =
-    `Time: ${start.toFixed(1)}–${end.toFixed(1)} s (window ${viewDurationSec.toFixed(1)} s)`;
-}
 
-function updatePanThumb() {
-  if (!lastRecording) {
-    panThumb.style.width = "100%";
-    panThumb.style.left = "0%";
-    return;
-  }
+  // --- Zoom slider -------------------------------------------------------
 
-  const spanSec = Math.min(lastRecording.durationSec || 0, maxViewSpanSec);
-  if (spanSec <= 0) {
-    panThumb.style.width = "100%";
-    panThumb.style.left = "0%";
-    return;
-  }
+  zoomSlider.addEventListener("input", () => {
+    if (!lastRecording) return;
+    const sliderVal = Number(zoomSlider.value) || 1;
 
-  const windowSec = Math.min(viewDurationSec, spanSec);
-  const fracWidth = windowSec / spanSec;
+    const duration = lastRecording.durationSec || 1;
+    maxViewSpanSec = duration;
 
-  if (spanSec <= windowSec || fracWidth >= 0.999) {
-    // fully zoomed out: thumb spans entire track
-    panThumb.style.width = "100%";
-    panThumb.style.left = "0%";
-    return;
-  }
+    const minWindow = 0.25;
+    const maxWindow = Math.min(duration, maxViewSpanSec);
+    const t = sliderVal / 100;
+    const lnMin = Math.log(minWindow);
+    const lnMax = Math.log(maxWindow);
+    const lnVal = lnMin + (lnMax - lnMin) * (1 - t);
+    viewDurationSec = Math.exp(lnVal);
 
-  const maxStart = spanSec - windowSec;
-  const clampedStart = Math.min(Math.max(viewStartSec, 0), maxStart);
+    const maxStart = Math.max(0, duration - viewDurationSec);
+    viewStartSec = Math.min(Math.max(viewStartSec, 0), maxStart);
 
-  const widthPct = fracWidth * 100;
-  const fracStart = clampedStart / maxStart;
-  const leftPct = fracStart * (100 - widthPct);
+    updateTimeLabel();
+    updatePanThumb();
 
-  panThumb.style.width = `${widthPct}%`;
-  panThumb.style.left = `${leftPct}%`;
-}
-function updateViewFromZoom() {
-  if (!lastRecording) return;
+    drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+    drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+  });
 
-  const spanSec = Math.min(lastRecording.durationSec || 0, maxViewSpanSec);
-  const minWindowSec = 1;
-  const span = Math.max(minWindowSec, spanSec);
+  // --- Pan thumb dragging ------------------------------------------------
 
-  const zoomVal = Number(zoomSlider.value) || 0; // 0..100
-  const tZoom = zoomVal / 100;
-  viewDurationSec = span - tZoom * (span - minWindowSec);
+  panThumb.addEventListener("mousedown", (event) => {
+    if (!lastRecording) return;
+    isPanning = true;
+    event.preventDefault();
+  });
 
-  const maxStart = Math.max(0, span - viewDurationSec);
-  viewStartSec = Math.min(Math.max(viewStartSec, 0), maxStart);
+  document.addEventListener("mouseup", () => {
+    isPanning = false;
+  });
 
-  updateTimeLabel();
-  updatePanThumb();
+  document.addEventListener("mousemove", (event) => {
+    if (!isPanning || !lastRecording) return;
 
-  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-}
+    const rect = panTrack.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const frac = x / Math.max(rect.width, 1);
 
-zoomSlider.addEventListener("input", updateViewFromZoom);
+    panToFraction(frac);
+  });
 
-function setViewStartFromPan(clientX) {
-  if (!lastRecording) return;
+  // --- Click pan track to reposition ------------------------------------
 
-  const spanSec = Math.min(lastRecording.durationSec || 0, maxViewSpanSec);
-  const minWindowSec = 1;
-  const span = Math.max(minWindowSec, spanSec);
+  panTrack.addEventListener("mousedown", (event) => {
+    if (!lastRecording) return;
 
-  if (span <= viewDurationSec) {
-    viewStartSec = 0;
-    return;
-  }
+    const rect = panTrack.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const frac = x / Math.max(rect.width, 1);
 
-  const rect = panTrack.getBoundingClientRect();
-  const x = clientX - rect.left;
-  const fx = Math.min(Math.max(x / rect.width, 0), 1);
+    panToFraction(frac);
+  });
 
-  const maxStart = span - viewDurationSec;
-  viewStartSec = fx * maxStart;
+  // --- Frequency range editing ------------------------------------------
 
-  updateTimeLabel();
-  updatePanThumb();
+  freqRangeLabel.addEventListener("click", () => {
+    if (!lastRecording) return;
+    if (editingFreq) return;
 
-  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-  drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-}
+    editingFreq = true;
 
-panTrack.addEventListener("mousedown", (e) => {
-  isPanning = true;
-  setViewStartFromPan(e.clientX);
-});
+    const oldText = freqRangeLabel.textContent || "";
+    const currentMax = spectrogramMaxHz || 0;
 
-window.addEventListener("mousemove", (e) => {
-  if (!isPanning) return;
-  setViewStartFromPan(e.clientX);
-});
+    while (freqRangeLabel.firstChild) {
+      freqRangeLabel.removeChild(freqRangeLabel.firstChild);
+    }
 
-window.addEventListener("mouseup", () => {
-  isPanning = false;
-});
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = currentMax > 0 ? String(currentMax) : "";
+    input.style.width = "80px";
 
+    const spanHz = document.createElement("span");
+    spanHz.textContent = " Hz";
+
+    freqRangeLabel.appendChild(document.createTextNode("Freq: 0–"));
+    freqRangeLabel.appendChild(input);
+    freqRangeLabel.appendChild(spanHz);
+
+    input.focus();
+    input.select();
+
+    function finishEditing(cancel) {
+      if (!editingFreq) return;
+      editingFreq = false;
+
+      while (freqRangeLabel.firstChild) {
+        freqRangeLabel.removeChild(freqRangeLabel.firstChild);
+      }
+
+      if (cancel) {
+        freqRangeLabel.textContent = oldText;
+        return;
+      }
+
+      const val = Number(input.value);
+      const fs = lastRecording.channels?.[0]?.fs || 256;
+      const nyquist = fs / 2;
+
+      if (!Number.isFinite(val) || val <= 0) {
+        spectrogramMaxHz = null;
+      } else {
+        spectrogramMaxHz = Math.min(Math.max(val, 1), nyquist);
+      }
+
+      freqRangeLabel.textContent =
+        `Freq: 0–${spectrogramMaxHz.toFixed(1)} Hz`;
+
+      if (lastRecording) {
+        drawSpectrogram(
+          spectrogramCtx,
+          spectrogramCanvas,
+          lastRecording,
+          spectrogramVisible
+        );
+      }
+    }
+
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        finishEditing(false);
+      } else if (ev.key === "Escape") {
+        finishEditing(true);
+      }
+    });
+
+    input.addEventListener("blur", () => {
+      finishEditing(false);
+    });
+  });
+
+  // --- Window resize handling -------------------------------------------
+
+  window.addEventListener("resize", () => {
+    resizeCanvasToDisplaySize(waveformCanvas);
+    resizeCanvasToDisplaySize(spectrogramCanvas);
+    updatePanThumb();
+    if (lastRecording) {
+      drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+      drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+    }
+  });
+
+  // --- Use a new Recording ----------------------------------------------
+
+  /**
+   * Called when we’ve loaded a (possibly partial) EDF Recording.
+   * @param {Recording} recording
+   */
   function useRecording(recording) {
     lastRecording = recording;
-    if (!lastRecording || !lastRecording.channels || lastRecording.channels.length === 0) {
+
+    if (!recording || !recording.channels || recording.channels.length === 0) {
       fileInfo.textContent = "No data in recording.";
       waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
       spectrogramCtx.clearRect(0, 0, spectrogramCanvas.width, spectrogramCanvas.height);
@@ -429,9 +404,10 @@ window.addEventListener("mouseup", () => {
       spectrogramControls.innerHTML = "";
       timeLabel.textContent = "";
       updatePanThumb();
+	  if (saveViewButton) saveViewButton.disabled = true;
       return;
     }
-
+	if (saveViewButton) saveViewButton.disabled = false;
     buildChannelControls(lastRecording);
 
     maxViewSpanSec = lastRecording.durationSec || 10;
@@ -441,654 +417,87 @@ window.addEventListener("mouseup", () => {
     viewDurationSec = maxViewSpanSec;
 
     zoomSlider.value = "0";
+
+    resizeCanvasToDisplaySize(waveformCanvas);
+    resizeCanvasToDisplaySize(spectrogramCanvas);
+
     updateTimeLabel();
     updatePanThumb();
 
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
     drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
   }
+	if (saveViewButton) {
+	  saveViewButton.addEventListener("click", () => {
+		if (!lastRecording) return;
 
-function computeDisplayRanges(recording) {
-  if (!recording || !recording.channels) return;
+		// Use waveform visibility as “selected channels”
+		const channelIndices = [];
+		for (let i = 0; i < waveformVisible.length; i++) {
+		  if (waveformVisible[i]) channelIndices.push(i);
+		}
+		if (channelIndices.length === 0) {
+		  alert("No channels selected to save.");
+		  return;
+		}
 
-  for (const ch of recording.channels) {
-    const s = ch.samples;
-    if (!s || s.length === 0) {
-      ch.displayMin = -1;
-      ch.displayMax = 1;
-      continue;
-    }
+		const baseName =
+		  (lastFileName ? lastFileName.replace(/\.[^.]+$/, "") : "recording") +
+		  "_view";
+		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const filename = `${baseName}_${timestamp}.edf`;
 
-    let minV = Infinity;
-    let maxV = -Infinity;
-
-    // downsample for speed if very long
-    const step = Math.max(1, Math.floor(s.length / 20000));
-    for (let i = 0; i < s.length; i += step) {
-      const v = s[i];
-      if (v < minV) minV = v;
-      if (v > maxV) maxV = v;
-    }
-
-    if (!Number.isFinite(minV) || !Number.isFinite(maxV) || minV === maxV) {
-      minV = -1;
-      maxV = 1;
-    }
-
-    ch.displayMin = minV;
-    ch.displayMax = maxV;
-  }
-}
-
-//zoomSlider.addEventListener("input", updateViewFromSliders);
-  // --- Waveform drawing ------------------------------------------------
-
-  /**
-   * Draws all channels of the recording stacked vertically.
-   * Simple min/max-over-window renderer for speed.
-   *
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {HTMLCanvasElement} canvas
-   * @param {Recording} recording
-   */
-  /**
- * Draws all channels of the recording stacked vertically.
- * Auto-scales each channel to fit its strip.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {HTMLCanvasElement} canvas
- * @param {Recording} recording
- */
-function drawWaveform(ctx, canvas, recording, visible) {
-  resizeCanvasToDisplaySize(canvas);
-
-  const { channels, durationSec } = recording;
-  if (!channels || channels.length === 0) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    return;
-  }
-
-  // effective span we’re using (clamped)
-  const spanSec = Math.min(durationSec, maxViewSpanSec);
-  const startSec = Math.min(viewStartSec, Math.max(0, spanSec - viewDurationSec));
-  const windowSec = Math.min(viewDurationSec, spanSec);
-
-  const indices = [];
-  for (let i = 0; i < channels.length; i++) {
-    if (!visible || visible[i]) indices.push(i);
-  }
-  if (indices.length === 0) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    return;
-  }
-
-  const width = canvas.width;
-  const height = canvas.height;
-  const nChannels = indices.length;
-  const channelHeight = height / nChannels;
-  const padding = 4;
-
-  ctx.fillStyle = "#111";
-  ctx.fillRect(0, 0, width, height);
-
-  ctx.lineWidth = 1;
-
-  for (let ci = 0; ci < nChannels; ci++) {
-    const chIndex = indices[ci];
-    const ch = channels[chIndex];
-    const samples = ch.samples;
-    const fs = ch.fs || 256;
-
-    const totalSpanSamples = Math.min(samples.length, Math.floor(spanSec * fs));
-    const windowSamples = Math.min(Math.floor(windowSec * fs), totalSpanSamples);
-    const startSample = Math.min(Math.floor(startSec * fs), totalSpanSamples - windowSamples);
-
-    if (windowSamples <= 0) continue;
-
-    const seg = samples.subarray(startSample, startSample + windowSamples);
-    const nSamples = seg.length;
-
-    const yTop = ci * channelHeight;
-    const yMid = yTop + channelHeight / 2;
-
-    ctx.fillStyle = "#aaa";
-    ctx.font = "10px system-ui";
-    ctx.fillText(ch.name || `Ch ${chIndex + 1}`, 5, yTop + 12);
-
-    ctx.strokeStyle = "#333";
-    ctx.beginPath();
-    ctx.moveTo(0, yMid);
-    ctx.lineTo(width, yMid);
-    ctx.stroke();
-
-	// use global per-channel range so scale is stable across pan/zoom
-	let minV = ch.displayMin;
-	let maxV = ch.displayMax;
-
-	if (!Number.isFinite(minV) || !Number.isFinite(maxV) || minV === maxV) {
-	  // fallback to a simple +/-1 range if something went wrong
-	  minV = -1;
-	  maxV = 1;
+		window.LucidifyDownloadEdfFromView({
+		  recording: lastRecording,
+		  channelIndices,
+		  viewStartSec,
+		  viewDurationSec,
+		  patientId: "X",
+		  recordingId: `Trimmed from ${lastFileName || "EDF"}`,
+		  filename
+		});
+	  });
 	}
 
-	const center = 0.5 * (maxV + minV);
-	const halfRange = Math.max((maxV - minV) / 2, 1e-6);
-	const scale = (channelHeight / 2 - padding) / halfRange;
-
-    const samplesPerPixel = nSamples / width;
-
-    ctx.strokeStyle = "#0f0";
-    ctx.beginPath();
-
-    for (let x = 0; x < width; x++) {
-      const sampleStart = Math.floor(x * samplesPerPixel);
-      const sampleEnd = Math.floor((x + 1) * samplesPerPixel);
-
-      let localMin = Infinity;
-      let localMax = -Infinity;
-
-      for (let i = sampleStart; i < sampleEnd && i < nSamples; i++) {
-        const v = seg[i];
-        if (v < localMin) localMin = v;
-        if (v > localMax) localMax = v;
-      }
-      if (!Number.isFinite(localMin) || !Number.isFinite(localMax)) continue;
-
-      const yMin = yMid - (localMax - center) * scale;
-      const yMax = yMid - (localMin - center) * scale;
-
-      ctx.moveTo(x + 0.5, yMin);
-      ctx.lineTo(x + 0.5, yMax);
-    }
-
-    ctx.stroke();
-  }
-}
-
-// ---- Spectrogram helpers ----------------------------------------------
-
-function hannWindow(N) {
-  const w = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
-  }
-  return w;
-}
-
-// in-place radix-2 Cooley–Tukey FFT on real/imag arrays
-function fftRadix2(re, im) {
-  const n = re.length;
-  if (n !== im.length) throw new Error("re/im length mismatch");
-  const levels = Math.log2(n) | 0;
-  if (1 << levels !== n) throw new Error("FFT length must be power of 2");
-
-  // bit-reverse
-  for (let i = 0; i < n; i++) {
-    let j = 0;
-    for (let k = 0; k < levels; k++) {
-      j = (j << 1) | ((i >> k) & 1);
-    }
-    if (j > i) {
-      let tmp = re[i]; re[i] = re[j]; re[j] = tmp;
-      tmp = im[i]; im[i] = im[j]; im[j] = tmp;
-    }
-  }
-
-  for (let size = 2; size <= n; size <<= 1) {
-    const half = size >> 1;
-    const step = (2 * Math.PI) / size;
-    for (let i = 0; i < n; i += size) {
-      for (let j = 0; j < half; j++) {
-        const k = i + j;
-        const l = k + half;
-        const angle = step * j;
-        const cos = Math.cos(angle);
-        const sin = Math.sin(angle);
-
-        const tre = cos * re[l] - sin * im[l];
-        const tim = sin * re[l] + cos * im[l];
-
-        re[l] = re[k] - tre;
-        im[l] = im[k] - tim;
-        re[k] += tre;
-        im[k] += tim;
-      }
-    }
-  }
-}
-// Map 0..1 -> black→blue→green→yellow→red, >1 -> white
-function hotColdColor(norm) {
-  let t = norm;
-  if (t < 0) t = 0;
-  if (t > 1) t = 1;
-
-  let r = 0, g = 0, b = 0;
-
-  if (t <= 0.25) {
-    // black -> blue
-    const u = t / 0.25;
-    r = 0;
-    g = 0;
-    b = Math.round(255 * u);
-  } else if (t <= 0.5) {
-    // blue -> green
-    const u = (t - 0.25) / 0.25;
-    r = 0;
-    g = Math.round(255 * u);
-    b = Math.round(255 * (1 - u));
-  } else if (t <= 0.75) {
-    // green -> yellow
-    const u = (t - 0.5) / 0.25;
-    r = Math.round(255 * u);
-    g = 255;
-    b = 0;
-  } else {
-    // yellow -> red
-    const u = (t - 0.75) / 0.25;
-    r = 255;
-    g = Math.round(255 * (1 - u));
-    b = 0;
-  }
-
-  return [r, g, b];
-}
-
-/**
- * Draw a spectrogram for one channel.
- * Uses at most the first 60 seconds of data for speed.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {HTMLCanvasElement} canvas
- * @param {Recording} recording
- * @param {number} channelIndex
- */
-/**
- * Draw spectrograms for multiple channels stacked vertically.
- * Uses at most the first 60 seconds of each channel.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {HTMLCanvasElement} canvas
- * @param {Recording} recording
- */
-function drawSpectrogram(ctx, canvas, recording, visible) {
-  resizeCanvasToDisplaySize(canvas);
-
-  const { channels, durationSec } = recording;
-  if (!channels || channels.length === 0) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    return;
-  }
-
-  const indices = [];
-  for (let i = 0; i < channels.length; i++) {
-    if (!visible || visible[i]) indices.push(i);
-  }
-  if (indices.length === 0) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    return;
-  }
-
-  const spanSec = Math.min(durationSec, maxViewSpanSec);
-  const startSec = Math.min(viewStartSec, Math.max(0, spanSec - viewDurationSec));
-  const windowSec = Math.min(viewDurationSec, spanSec);
-
-  const width = canvas.width;
-  const height = canvas.height;
-  const maxChannelsToDraw = 8;
-  const nChannels = Math.min(indices.length, maxChannelsToDraw);
-  const channelHeight = height / nChannels;
-
-  const winSize = 512;
-  const hop = winSize >> 2;
-  const nFreq = winSize >> 1;
-  const window = hannWindow(winSize);
-
-
-  // First pass: compute spectrograms and global min/max
-  /** @type {Float32Array[][]} */
-   const specs = new Array(nChannels);
-  const framesPerChannel = new Array(nChannels);
-  let globalMin = Infinity;
-  let globalMax = -Infinity;
-
-  let fsForLabel = null;
-
-  for (let ci = 0; ci < nChannels; ci++) {
-    const chIndex = indices[ci];
-    const ch = channels[chIndex];
-    const fs = ch.fs || 256;
-    const samples = ch.samples;
-
-    if (fsForLabel == null && fs > 0) {
-      fsForLabel = fs;
-    }
-
-    const totalSpanSamples = Math.min(samples.length, Math.floor(spanSec * fs));
-    const windowSamples = Math.min(Math.floor(windowSec * fs), totalSpanSamples);
-    const startSample = Math.min(Math.floor(startSec * fs), totalSpanSamples - windowSamples);
-
-    if (windowSamples < winSize + 1) {
-      specs[ci] = null;
-      framesPerChannel[ci] = 0;
-      continue;
-    }
-
-    const segment = samples.subarray(startSample, startSample + windowSamples);
-    const nFrames = Math.floor((segment.length - winSize) / hop) + 1;
-    framesPerChannel[ci] = nFrames;
-
-    const re = new Float32Array(winSize);
-    const im = new Float32Array(winSize);
-    const specRows = new Array(nFrames);
-
-    for (let f = 0; f < nFrames; f++) {
-      const offset = f * hop;
-      for (let i = 0; i < winSize; i++) {
-        const v = segment[offset + i] || 0;
-        re[i] = v * window[i];
-        im[i] = 0;
-      }
-
-      fftRadix2(re, im);
-
-      const row = new Float32Array(nFreq);
-      for (let k = 0; k < nFreq; k++) {
-        const mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
-        const val = Math.log10(mag + 1e-6);
-        row[k] = val;
-        if (val < globalMin) globalMin = val;
-        if (val > globalMax) globalMax = val;
-      }
-      specRows[f] = row;
-    }
-
-    specs[ci] = specRows;
-  }
-
-	if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax) || globalMin === globalMax) {
-	  ctx.clearRect(0, 0, width, height);
-	  return;
-	}
-
-	// Nyquist and effective max display freq
-	if (!fsForLabel) fsForLabel = 256;
-	const nyquist = fsForLabel / 2;
-
-	// If override is null or above Nyquist, clamp to Nyquist
-	if (spectrogramMaxHz === null || !Number.isFinite(spectrogramMaxHz) || spectrogramMaxHz <= 0) {
-	  spectrogramMaxHz = nyquist;
-	} else if (spectrogramMaxHz > nyquist) {
-	  spectrogramMaxHz = nyquist;
-	}
-
-	const effectiveMaxHz = spectrogramMaxHz;
-	if (!editingFreq) {
-		freqRangeLabel.textContent = `Freq: 0–${effectiveMaxHz.toFixed(1)} Hz`;
-	}
-
-	// Precompute the highest bin we will show
-	const maxBin = Math.max(
-	  1,
-	  Math.min(
-		nFreq - 1,
-		Math.floor((effectiveMaxHz / nyquist) * (nFreq - 1))
-	  )
-	);
-
-
-  // Second pass: render into a single imageData
-    // Second pass: render into a single imageData
-  const imageData = ctx.createImageData(width, height);
-  const data = imageData.data;
-
-  for (let ci = 0; ci < nChannels; ci++) {
-    const chIndex = indices[ci]; // original channel index (for labels if needed)
-    const specRows = specs[ci];  // use ci here, not chIndex
-    const nFrames = framesPerChannel[ci];
-    if (!specRows || nFrames === 0) continue;
-
-    const yStart = Math.floor(ci * channelHeight);
-    const chHeight = Math.floor(channelHeight);
-
-    for (let yLocal = 0; yLocal < chHeight; yLocal++) {
-      const y = yStart + yLocal;
-      if (y >= height) break;
-
-	const freqFrac = 1 - yLocal / Math.max(1, chHeight - 1);
-	const freqIndex = Math.min(
-	  maxBin,
-	  Math.floor(freqFrac * maxBin)
-	);
-
-      for (let x = 0; x < width; x++) {
-        const tFrac = x / Math.max(1, width - 1);
-        const frameIndex = Math.min(nFrames - 1, Math.floor(tFrac * nFrames));
-        const val = specRows[frameIndex][freqIndex];
-
-        let norm = (val - globalMin) / (globalMax - globalMin);
-        if (!Number.isFinite(norm)) norm = 0;
-
-        let r, g, b;
-        if (norm > 1.0) {
-          r = g = b = 255; // clipping => white
-        } else {
-          [r, g, b] = hotColdColor(norm);
-        }
-
-        const idx = (y * width + x) * 4;
-        data[idx + 0] = r;
-        data[idx + 1] = g;
-        data[idx + 2] = b;
-        data[idx + 3] = 255;
-      }
-    }
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-}
-
-
-// ---- EDF parsing ------------------------------------------------------
-
-function readAscii(bytes, start, length) {
-  const slice = bytes.slice(start, start + length);
-  return new TextDecoder("ascii").decode(slice).trim();
-}
-
-function readNumber(bytes, start, length) {
-  const txt = readAscii(bytes, start, length);
-  const n = Number(txt);
-  return Number.isNaN(n) ? 0 : n;
-}
-
-/**
- * Parse an EDF file into a Recording.
- * @param {ArrayBuffer} buffer
- * @returns {Recording}
- */
-function parseEdf(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const dv = new DataView(buffer);
-
-  // ---- main header (first 256 bytes) ----
-  // EDF spec:
-  // 184–191: header bytes
-  // 236–243: number of data records
-  // 244–251: duration of one data record (sec)
-  // 252–255: number of signals
-  const headerBytes          = readNumber(bytes, 184, 8);
-  const nDataRecords         = readNumber(bytes, 236, 8);
-  const durationSecPerRecord = readNumber(bytes, 244, 8);
-  const nSignals             = readNumber(bytes, 252, 4);
-
-  console.log("EDF headerBytes:", headerBytes,
-              "nDataRecords:", nDataRecords,
-              "dur/rec:", durationSecPerRecord,
-              "nSignals:", nSignals);
-
-  if (!Number.isFinite(headerBytes) ||
-      !Number.isFinite(nSignals) ||
-      nSignals <= 0 ||
-      !Number.isFinite(durationSecPerRecord) ||
-      durationSecPerRecord <= 0) {
-    throw new Error("Invalid EDF header");
-  }
-
-  // ---- per-signal fields are stored column-wise, not 256 bytes per signal ----
-  const base = 256; // start of signal header area
-
-  const labelsOffset           = base;
-  const transducerOffset       = labelsOffset           + 16 * nSignals;
-  const physDimOffset          = transducerOffset       + 80 * nSignals;
-  const physMinOffset          = physDimOffset          +  8 * nSignals;
-  const physMaxOffset          = physMinOffset          +  8 * nSignals;
-  const digMinOffset           = physMaxOffset          +  8 * nSignals;
-  const digMaxOffset           = digMinOffset           +  8 * nSignals;
-  const prefilterOffset        = digMaxOffset           +  8 * nSignals;
-  const samplesPerRecordOffset = prefilterOffset        + 80 * nSignals;
-  const reservedOffset         = samplesPerRecordOffset +  8 * nSignals;
-  // headerBytes should be >= reservedOffset + 32 * nSignals
-
-  const labels = [];
-  const physMins = [];
-  const physMaxs = [];
-  const digMins = [];
-  const digMaxs = [];
-  const samplesPerRecord = [];
-
-  for (let s = 0; s < nSignals; s++) {
-    const label   = readAscii(bytes, labelsOffset           + 16 * s, 16);
-    const physMin = readNumber(bytes, physMinOffset         +  8 * s, 8);
-    const physMax = readNumber(bytes, physMaxOffset         +  8 * s, 8);
-    const digMin  = readNumber(bytes, digMinOffset          +  8 * s, 8);
-    const digMax  = readNumber(bytes, digMaxOffset          +  8 * s, 8);
-    const nSamp   = readNumber(bytes, samplesPerRecordOffset+  8 * s, 8);
-
-    labels.push(label || `Ch ${s + 1}`);
-    physMins.push(physMin);
-    physMaxs.push(physMax);
-    digMins.push(digMin);
-    digMaxs.push(digMax);
-    samplesPerRecord.push(nSamp);
-  }
-
-  // ---- data records ----
-  const bytesPerRecord =
-    samplesPerRecord.reduce((acc, n) => acc + n * 2, 0);
-
-  let records = nDataRecords;
-  if (records <= 0) {
-    records = Math.floor((bytes.length - headerBytes) / bytesPerRecord);
-  }
-
-  const durationSec = records * durationSecPerRecord;
-
-  /** @type {Channel[]} */
-  const channels = [];
-
-  // precompute signal offsets inside one data record
-  const signalOffsets = [];
-  let off = 0;
-  for (let s = 0; s < nSignals; s++) {
-    signalOffsets.push(off);
-    off += samplesPerRecord[s] * 2;
-  }
-
-  for (let s = 0; s < nSignals; s++) {
-    const totalSamples = samplesPerRecord[s] * records;
-    const samples = new Float32Array(totalSamples);
-
-    const digMin = digMins[s];
-    const digMax = digMaxs[s];
-    const physMin = physMins[s];
-    const physMax = physMaxs[s];
-
-    const denom = (digMax - digMin) || 1;
-    const scale = (physMax - physMin) / denom;
-    const baseVal = physMin - scale * digMin;
-
-    let writeIndex = 0;
-
-    for (let r = 0; r < records; r++) {
-      const recordBase = headerBytes + r * bytesPerRecord;
-      const signalBase = recordBase + signalOffsets[s];
-      const nSamp = samplesPerRecord[s];
-
-      for (let i = 0; i < nSamp; i++) {
-        const byteOffset = signalBase + i * 2;
-        if (byteOffset + 1 >= bytes.length) break;
-        const digit = dv.getInt16(byteOffset, true); // little-endian
-        samples[writeIndex++] = baseVal + scale * digit;
-      }
-    }
-
-    const fs = samplesPerRecord[s] / durationSecPerRecord;
-
-    channels.push({
-      name: labels[s],
-      fs,
-      samples,
-    });
-  }
-
-  console.log("EDF parsed: channels =", channels.length,
-              "durationSec =", durationSec);
-
-	const recording = {
-	  durationSec,
-	  channels
-	};
-
-	computeDisplayRanges(recording);
-	return recording;
-}
-
-window.LucidifyParseEdf = parseEdf;
-    // --- File handling ---------------------------------------------------
+  // --- File handling ---------------------------------------------------
 
   fileInput.addEventListener("change", (event) => {
     const input = event.target;
-    if (!input.files || input.files.length === 0) {
+    if (!input.files || !input.files.length) {
       fileInfo.textContent = "No file selected.";
-      lastRecording = null;
-      waveformVisible = [];
-      spectrogramVisible = [];
-      waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
-      spectrogramCtx.clearRect(0, 0, spectrogramCanvas.width, spectrogramCanvas.height);
-      waveformControls.innerHTML = "";
-      spectrogramControls.innerHTML = "";
-      timeLabel.textContent = "";
-      updatePanThumb();
       return;
     }
 
     const file = input.files[0];
-    const nameLower = (file.name || "").toLowerCase();
+    const { name, size } = file;
 
-    fileInfo.textContent = `Selected: ${file.name} (${file.size} bytes)`;
-    console.log("Selected file:", file);
+    fileInfo.textContent = `Selected file: ${name} (${(size / (1024 * 1024)).toFixed(2)} MB)`;
 
-    // Let the large-file segment loader intercept big EDFs
-    if (
-      segmentLoader &&
-      nameLower.endsWith(".edf") &&
-      file.size >= LARGE_FILE_THRESHOLD_BYTES
-    ) {
-      const handled = segmentLoader.handleFile(file);
-      if (handled) {
-        // LargeEdfSegmentLoader will show its own UI and call onSegmentReady
-        return;
+	lastFileName = name;
+	if (saveViewButton) {
+	  saveViewButton.disabled = true; // will re-enable once recording is valid
+	}
+
+    if (segmentLoader && size >= LARGE_FILE_THRESHOLD_BYTES) {
+      try {
+        const taken = segmentLoader.handleFile(file);
+        if (taken) {
+          fileInfo.textContent = "Loading large EDF segment…";
+          return; // Large loader will call onSegmentReady/useRecording later
+        }
+      } catch (err) {
+        console.warn("Segment loader failed, falling back:", err);
       }
     }
 
+
     const reader = new FileReader();
 
-    reader.onload = () => {
-      const arrayBuffer = reader.result;
-      const bytes = new Uint8Array(arrayBuffer);
-      console.log("File loaded, first 64 bytes:", bytes.slice(0, 64));
-
+    reader.onload = (ev) => {
       try {
+        const arrayBuffer = ev.target.result;
+        const nameLower = (name || "").toLowerCase();
+
         if (nameLower.endsWith(".edf")) {
           const recording = parseEdf(arrayBuffer);
           useRecording(recording);
@@ -1118,4 +527,3 @@ window.LucidifyParseEdf = parseEdf;
   drawWaveform(waveformCtx, waveformCanvas, lastRecording);
   drawSpectrogram(spectrogramCtx,spectrogramCanvas,lastRecording);
 });
-

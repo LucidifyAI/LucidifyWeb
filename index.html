@@ -20,6 +20,7 @@
         accept=".edf"
       />
       <p id="file-info"></p>
+	  <button id="save-view-button" disabled>Save view as EDF</button>
     </section>
 
 	<section id="views">
@@ -59,7 +60,10 @@
 
   </main>
 
-  <script src="large_edf_segment_loader.js"></script>
-  <script src="main.js"></script>
+	<script src="edf_parser.js"></script>
+	<script src="renderers.js"></script>
+	<script src="large_edf_segment_loader.js"></script>
+	<script src="edf_writer.js"></script>
+	<script src="main.js"></script>
 </body>
 </html>

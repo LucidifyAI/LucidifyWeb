@@ -1,9 +1,19 @@
-// LargeEdfSegmentLoader
-// - Intercepts large EDF files
-// - Lets the user choose a time window and subset of channels
-// - Loads only that segment into memory and returns a Recording object:
-//     { durationSec: number, channels: [ { name, fs, samples: Float32Array } ] }
+/*
+ Lucidify EDF Tools - Copyright (c) 2025 Lucidify
+ All rights reserved.
 
+ This source code is provided for use only within the Lucidify platform
+ and associated research tools. Redistribution, reproduction, or use of
+ any portion of this file outside Lucidify projects is not permitted
+ without written permission.
+
+ The algorithms and methods implemented here represent proprietary work
+ under active development. Unauthorized reuse may violate copyright or
+ research licensing agreements.
+
+ If you need access, licensing, or integration support, contact:
+ support@lucidify.ai
+*/
 (function () {
   "use strict";
 
@@ -465,76 +475,6 @@
       out.set(enc.encode(recStr), 236);
 
       return out.buffer;
-    }
-
-    _decodeSegment(dataBuf, info, selectedIndices, recCount, clampedStart, clampedEnd) {
-      const {
-        durationSecPerRecord,
-        labels,
-        physMin,
-        physMax,
-        digMin,
-        digMax,
-        samplesPerRecord,
-        totalSamplesPerRecord,
-        samplingRatesHz
-      } = info;
-
-      const bytesPerRecord = totalSamplesPerRecord * 2;
-      const view = new DataView(dataBuf);
-
-      // Precompute channel offsets within a record (in bytes)
-      const chanOffsetBytes = new Array(info.nSignals);
-      let offsetSamples = 0;
-      for (let i = 0; i < info.nSignals; i++) {
-        chanOffsetBytes[i] = offsetSamples * 2;
-        offsetSamples += samplesPerRecord[i] || 0;
-      }
-
-      const channels = [];
-
-      for (const chIndex of selectedIndices) {
-        const nPerRec = samplesPerRecord[chIndex] || 0;
-        const fs = samplingRatesHz[chIndex] || 0;
-        const label = labels[chIndex] || `Ch ${chIndex + 1}`;
-
-        const nSamplesTotal = nPerRec * recCount;
-        const out = new Float32Array(nSamplesTotal);
-
-        const pMin = physMin[chIndex];
-        const pMax = physMax[chIndex];
-        const dMin = digMin[chIndex];
-        const dMax = digMax[chIndex];
-
-        const spanPhys = pMax - pMin || 1;
-        const spanDig = dMax - dMin || 1;
-        const scale = spanPhys / spanDig;
-
-        const chanOffset = chanOffsetBytes[chIndex];
-
-        let writePos = 0;
-        for (let r = 0; r < recCount; r++) {
-          const recBase = r * bytesPerRecord;
-          const base = recBase + chanOffset;
-          for (let s = 0; s < nPerRec; s++) {
-            const raw = view.getInt16(base + 2 * s, true); // EDF uses little-endian
-            const phys = pMin + (raw - dMin) * scale;
-            out[writePos++] = phys;
-          }
-        }
-
-        channels.push({
-          name: label,
-          fs,
-          samples: out
-        });
-      }
-
-      const durationSecSegment = clampedEnd - clampedStart;
-      return {
-        durationSec: durationSecSegment,
-        channels
-      };
     }
   }
 
