@@ -17,6 +17,8 @@
 console.log("Lucidify EEG Viewer starting…");
 
 window.addEventListener("DOMContentLoaded", () => {
+  const viewerSections = document.getElementById("views");
+  viewerSections.classList.add("hidden");
   const fileInput = document.getElementById("file-input");
   const fileInfo = document.getElementById("file-info");
 
@@ -26,8 +28,11 @@ window.addEventListener("DOMContentLoaded", () => {
   const spectrogramCanvas = document.getElementById("spectrogram-canvas");
   const spectrogramCtx = spectrogramCanvas.getContext("2d");
   
+  const hypnogramCanvas = document.getElementById("hypnogram-canvas");
+  
   const waveformControls = document.getElementById("waveform-controls");
   const spectrogramControls = document.getElementById("spectrogram-controls");
+  const hypnogramControls = document.getElementById("hypnogram-controls");
   
   const zoomSlider = document.getElementById("zoom-slider");
   const panTrack = document.getElementById("pan-track");
@@ -38,6 +43,38 @@ window.addEventListener("DOMContentLoaded", () => {
   const LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024; // 50 MB, tweak as needed
   
   const saveViewButton = document.getElementById("save-view-button");
+  const spectrogramRefreshBtn = document.getElementById("spectrogram-refresh-button");
+  const hypnogramRefreshBtn   = document.getElementById("hypnogram-refresh-button");
+  
+  const spectrogramChannelControls = document.getElementById("spectrogram-channel-controls");
+  const hypnogramChannelControls   = document.getElementById("hypnogram-channel-controls");
+  
+  spectrogramRefreshBtn?.addEventListener("click", async () => {
+    if (!lastRecording) return;
+    setSectionLoading(spectrogramSection, true);
+    await nextPaint();
+    try {
+      drawSpectrogram(
+        spectrogramCtx,
+        spectrogramCanvas,
+        lastRecording,
+        spectrogramVisible
+      );
+    } finally {
+      setSectionLoading(spectrogramSection, false);
+    }
+  });
+  
+  hypnogramRefreshBtn?.addEventListener("click", async () => {
+    if (!lastRecording) return;
+    setSectionLoading(hypnogramSection, true);
+    await nextPaint();
+    try {
+      renderHypnogramFromSelection(); // already window-sliced
+    } finally {
+      setSectionLoading(hypnogramSection, false);
+    }
+  });
   // Optional large-file segment loader (from large_edf_segment_loader.js)
   const segmentLoader = window.LargeEdfSegmentLoader
     ? new window.LargeEdfSegmentLoader({
@@ -71,6 +108,7 @@ window.addEventListener("DOMContentLoaded", () => {
   let lastFileName = null; 
   let waveformVisible = [];
   let spectrogramVisible = [];
+  let hypnogramVisible = [];
   
   // shared view window (seconds)
   let viewStartSec = 0;
@@ -87,6 +125,10 @@ window.addEventListener("DOMContentLoaded", () => {
   const drawWaveform = window.LucidifyDrawWaveform;
   const drawSpectrogram = window.LucidifyDrawSpectrogram;
   const resizeCanvasToDisplaySize = window.LucidifyResizeCanvasToDisplaySize;
+  
+  const waveformSection = document.getElementById("waveform-section");
+  const spectrogramSection = document.getElementById("spectrogram-section");
+  const hypnogramSection = document.getElementById("hypnogram-section");
 
   if (window.LucidifyBindRenderViewState) {
     window.LucidifyBindRenderViewState({
@@ -105,7 +147,18 @@ window.addEventListener("DOMContentLoaded", () => {
   }
   
   // --- UI / state helpers ------------------------------------------------
-
+  function setSectionLoading(sectionEl, isLoading) {
+    if (!sectionEl) return;
+    const overlay = sectionEl.querySelector(".section-overlay");
+    if (overlay) overlay.classList.toggle("hidden", !isLoading);
+    sectionEl.classList.toggle("loading", isLoading);
+  }
+  const loadingOverlay = document.getElementById("loading-overlay");
+  
+  function setLoading(isLoading) {
+    if (!loadingOverlay) return;
+    loadingOverlay.classList.toggle("hidden", !isLoading);
+  }
   function updateTimeLabel() {
     if (!lastRecording) {
       timeLabel.textContent = "";
@@ -116,7 +169,179 @@ window.addEventListener("DOMContentLoaded", () => {
       `Time: ${viewStartSec.toFixed(2)}–${end.toFixed(2)} s / ` +
       `${lastRecording.durationSec.toFixed(2)} s`;
   }
+  function mergeChannels(recording, indices) {
+    const chans = recording.channels;
+    const fs = chans[indices[0]].fs;
+  
+    let minLen = Infinity;
+    for (const i of indices) {
+      if (chans[i].fs !== fs) {
+        throw new Error("Hypnogram channels must share the same sampling rate.");
+      }
+      minLen = Math.min(minLen, chans[i].samples.length);
+    }
+  
+    const out = new Float32Array(minLen);
+    for (const i of indices) {
+      const s = chans[i].samples;
+      for (let j = 0; j < minLen; j++) out[j] += s[j];
+    }
+  
+    const inv = 1 / indices.length;
+    for (let j = 0; j < minLen; j++) out[j] *= inv;
+  
+    return { samples: out, fs, physDim: chans[indices[0]].physDim };
+  }
+  
+  function normalizeToVolts(samples, physDim) {
+    const d = (physDim || "").trim();
+    let mul = 1.0;
+    if (d === "uV" || d === "µV") mul = 1e-6;
+    else if (d === "mV") mul = 1e-3;
+  
+    if (mul === 1.0) return samples;
+  
+    const out = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) out[i] = samples[i] * mul;
+    return out;
+  }
+  function nextPaint() {
+    return new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    );
+  }
+  function sliceView(samples, fs) {
+    const startSamp = Math.max(0, Math.floor(viewStartSec * fs));
+    const endSamp = Math.min(samples.length, Math.floor((viewStartSec + viewDurationSec) * fs));
+    if (endSamp <= startSamp) return samples.subarray(0, 0);
+    return samples.subarray(startSamp, endSamp);
+  }
+  function viterbiSmoothSleepStages(probs, labels) {
+  // probs: Array[T] of Array[K] (K must match labels.length)
+    const T = probs?.length || 0;
+    const K = labels?.length || 0;
+    if (!T || !K) return [];
+  
+    const eps = 1e-12;
+  
+    // ---- Transition model (hand-tuned, simple but effective) ----
+    // High self-transition; discourage impossible jumps.
+    // Order matches labels: ["W","N1","N2","N3","REM"]
+    // You can tweak these later.
+    const A = [
+      //  W     N1    N2    N3    REM
+      [0.94, 0.05, 0.009, 0.0005, 0.0005], // W
+      [0.08, 0.84, 0.07,  0.005,  0.005 ], // N1
+      [0.02, 0.08, 0.86,  0.03,   0.01  ], // N2
+      [0.005,0.01, 0.08,  0.90,   0.005 ], // N3
+      [0.06, 0.03, 0.08,  0.005,  0.825 ], // REM
+    ];
+  
+    // Initial state prior (typical: start awake)
+    const pi = [0.90, 0.08, 0.02, 0.0, 0.0];
+  
+    // Precompute logs
+    const logA = A.map(row => row.map(p => Math.log(Math.max(p, eps))));
+    const logPi = pi.map(p => Math.log(Math.max(p, eps)));
+  
+    // dp[t][k] = best log prob ending in state k at time t
+    const dp = Array.from({ length: T }, () => new Float64Array(K));
+    const back = Array.from({ length: T }, () => new Int16Array(K));
+  
+    // t = 0
+    for (let k = 0; k < K; k++) {
+      const e = Math.log(Math.max(probs[0][k] ?? 0, eps));
+      dp[0][k] = logPi[k] + e;
+      back[0][k] = 0;
+    }
+  
+    // t > 0
+    for (let t = 1; t < T; t++) {
+      for (let k = 0; k < K; k++) {
+        const e = Math.log(Math.max(probs[t][k] ?? 0, eps));
+        let bestVal = -Infinity;
+        let bestJ = 0;
+        for (let j = 0; j < K; j++) {
+          const v = dp[t - 1][j] + logA[j][k];
+          if (v > bestVal) { bestVal = v; bestJ = j; }
+        }
+        dp[t][k] = bestVal + e;
+        back[t][k] = bestJ;
+      }
+    }
+  
+    // Termination
+    let lastK = 0;
+    let bestLast = dp[T - 1][0];
+    for (let k = 1; k < K; k++) {
+      if (dp[T - 1][k] > bestLast) { bestLast = dp[T - 1][k]; lastK = k; }
+    }
+  
+    // Backtrack
+    const path = new Array(T);
+    for (let t = T - 1; t >= 0; t--) {
+      path[t] = labels[lastK];
+      lastK = back[t][lastK];
+    }
+    return path;
+  }
 
+  function renderHypnogramFromSelection() {
+    if (!lastRecording) return;
+  	resizeCanvasToDisplaySize(hypnogramCanvas);
+	hypnogramCanvas.height = 160; // enough vertical space for labels + steps
+	const ctx = hypnogramCanvas.getContext("2d");
+    ctx.clearRect(0, 0, hypnogramCanvas.width, hypnogramCanvas.height);
+    const indices = [];
+    for (let i = 0; i < hypnogramVisible.length; i++) {
+      if (hypnogramVisible[i]) indices.push(i);
+    }
+    if (indices.length === 0) return;
+  
+    const merged = mergeChannels(lastRecording, indices);
+	const samplesV_full = normalizeToVolts(merged.samples, merged.physDim);
+    const samplesV = sliceView(samplesV_full, merged.fs);
+	const fs = merged.fs;
+
+	// Clamp window to available samples
+	const startSamp = Math.max(0, Math.floor(viewStartSec * fs));
+	const endSamp = Math.min(samplesV.length, Math.floor((viewStartSec + viewDurationSec) * fs));
+
+	// Ensure we have at least 1 epoch
+	const epochSamp = Math.floor(30 * fs);
+	let a = startSamp;
+	let b = endSamp;
+	if (b - a < epochSamp) {
+	  // pad window to at least 1 epoch if possible
+	  b = Math.min(samplesV.length, a + epochSamp);
+	  a = Math.max(0, b - epochSamp);
+	}
+
+	const windowSamples = samplesV.slice(a, b);
+
+	const { stages, probs } =
+    window.LucidifySleepStage.runFromSamples(samplesV, merged.fs, 30);
+	const hmmCb = document.getElementById("hypnogram-hmm-checkbox");
+	let stagesToDraw = stages;
+
+	if (hmmCb?.checked && Array.isArray(probs) && probs.length === stages.length) {
+	  // MODEL label order is the probs order (W,N1,N2,N3,REM)
+	  const labels = ["W","N1","N2","N3","REM"];
+	  stagesToDraw = viterbiSmoothSleepStages(probs, labels);
+	}
+	const counts = {};
+	for (const s of stages) counts[s] = (counts[s] || 0) + 1;
+  
+	const usableW = hypnogramCanvas.width;
+	const leftMargin = 60; // matches labelLeft layout
+	const epochWidth = Math.max(
+	  1,
+	  Math.floor((usableW - leftMargin) / stages.length)
+	);
+	window.renderHypnogramStep(hypnogramCanvas, stagesToDraw, { leftMargin: 80 });
+  }
+  
+  
   // Pan thumb reflects which portion of the recording we’re viewing.
   function updatePanThumb() {
     if (!lastRecording || !panTrack) return;
@@ -137,12 +362,16 @@ window.addEventListener("DOMContentLoaded", () => {
     const ratio = windowSpan / span;
     const thumbWidth = Math.max(10, trackWidth * ratio);
 
-    const clampedStart = Math.max(0, Math.min(viewStartSec, span - windowSpan));
-    const posRatio = clampedStart / span;
-    const x = (trackWidth - thumbWidth) * posRatio;
+	const clampedStart = Math.max(0, Math.min(viewStartSec, span - windowSpan));
+	const maxStart = Math.max(0, span - windowSpan);
 
-    panThumb.style.width = `${thumbWidth}px`;
-    panThumb.style.transform = `translateX(${x}px)`;
+	// position should be 0..1 over the travel range
+	const posRatio = (maxStart > 0) ? (clampedStart / maxStart) : 0;
+
+	const x = (trackWidth - thumbWidth) * posRatio;
+
+	panThumb.style.width = `${thumbWidth}px`;
+	panThumb.style.transform = `translateX(${x}px)`;
   }
 
   // If the user drags the pan thumb, we reposition the view window.
@@ -162,7 +391,6 @@ window.addEventListener("DOMContentLoaded", () => {
     updatePanThumb();
 
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-    drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
   }
 
   // --- Channel visibility controls --------------------------------------
@@ -173,7 +401,8 @@ window.addEventListener("DOMContentLoaded", () => {
    */
 function buildChannelControls(recording) {
   waveformControls.innerHTML = "";
-  spectrogramControls.innerHTML = "";
+  spectrogramChannelControls.innerHTML = "";
+  hypnogramChannelControls.innerHTML = "";
 
   const channels = recording.channels || [];
   const n = channels.length;
@@ -181,6 +410,7 @@ function buildChannelControls(recording) {
   // Start with all channels OFF…
   waveformVisible = new Array(n).fill(false);
   spectrogramVisible = new Array(n).fill(false);
+  hypnogramVisible = new Array(n).fill(false);
 
   channels.forEach((ch, idx) => {
     const name = ch.name || `Ch ${idx + 1}`;
@@ -195,17 +425,17 @@ function buildChannelControls(recording) {
     const wCb = document.createElement("input");
     wCb.type = "checkbox";
     wCb.checked = defaultVisible;
-    wCb.addEventListener("change", (e) => {
-      waveformVisible[idx] = e.target.checked;
-      if (lastRecording) {
-        drawWaveform(
-          waveformCtx,
-          waveformCanvas,
-          lastRecording,
-          waveformVisible
-        );
-      }
-    });
+    wCb.addEventListener("change", async () => {
+	  waveformVisible[idx] = wCb.checked;
+
+	  setSectionLoading(waveformSection, true);
+	  await nextPaint();
+	  try {
+		drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+	  } finally {
+		setSectionLoading(waveformSection, false);
+	  }
+	});
     wLabel.appendChild(wCb);
     wLabel.appendChild(document.createTextNode(" " + name));
     waveformControls.appendChild(wLabel);
@@ -216,21 +446,58 @@ function buildChannelControls(recording) {
     const sCb = document.createElement("input");
     sCb.type = "checkbox";
     sCb.checked = defaultVisible;
-    sCb.addEventListener("change", (e) => {
-      spectrogramVisible[idx] = e.target.checked;
-      if (lastRecording) {
-        drawSpectrogram(
-          spectrogramCtx,
-          spectrogramCanvas,
-          lastRecording,
-          spectrogramVisible
-        );
-      }
+    sCb.addEventListener("change", async () => {
+      spectrogramVisible[idx] = sCb.checked;
+
+	  setSectionLoading(spectrogramSection, true);
+	  await nextPaint();
+	  try {
+		drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+	  } finally {
+		setSectionLoading(spectrogramSection, false);
+	  }
     });
     sLabel.appendChild(sCb);
     sLabel.appendChild(document.createTextNode(" " + name));
-    spectrogramControls.appendChild(sLabel);
-    spectrogramControls.appendChild(document.createElement("br"));
+    spectrogramChannelControls.appendChild(sLabel);
+    spectrogramChannelControls.appendChild(document.createElement("br"));
+	
+	// --- Hypnogram checkbox ---
+	// sensible default: first EEG-like channel ON
+	const hLabel = document.createElement("label");
+	const hCb = document.createElement("input");
+	hCb.type = "checkbox";
+	const defaultHypno = idx === 0;
+	hCb.checked = defaultHypno;
+	hypnogramVisible[idx] = defaultHypno;
+
+	hCb.addEventListener("change", async () => {
+	  hypnogramVisible[idx] = hCb.checked;
+
+	  setSectionLoading(hypnogramSection, true);
+	  await nextPaint();
+	  try {
+		renderHypnogramFromSelection();
+	  } finally {
+		setSectionLoading(hypnogramSection, false);
+	  }
+	});
+	document
+	  .getElementById("hypnogram-hmm-checkbox")
+	  ?.addEventListener("change", () => {
+		if (!lastRecording) return;
+		setSectionLoading(hypnogramSection, true);
+		nextPaint().then(() => {
+		  try { renderHypnogramFromSelection(); }
+		  finally { setSectionLoading(hypnogramSection, false); }
+		});
+	  });
+	hLabel.appendChild(hCb);
+	hLabel.appendChild(
+	  document.createTextNode(` ${ch.name}${ch.physDim ? " (" + ch.physDim + ")" : ""}`)
+	);
+	hypnogramChannelControls.appendChild(hLabel);
+	hypnogramChannelControls.appendChild(document.createElement("br"));
   });
 }
 
@@ -239,29 +506,34 @@ function buildChannelControls(recording) {
 
   zoomSlider.addEventListener("input", () => {
     if (!lastRecording) return;
-    const sliderVal = Number(zoomSlider.value) || 1;
-
+    const sliderVal = Number(zoomSlider.value);
+  
     const duration = lastRecording.durationSec || 1;
     maxViewSpanSec = duration;
-
-    const minWindow = 0.25;
-    const maxWindow = Math.min(duration, maxViewSpanSec);
-    const t = sliderVal / 100;
+  
+    const minWindow = Math.min(0.25, duration);
+    const maxWindow = duration;
+  
+    const minV = Number(zoomSlider.min || 1);
+    const maxV = Number(zoomSlider.max || 100);
+    const v = Math.min(Math.max(sliderVal, minV), maxV);
+    const t = (maxV === minV) ? 1 : ((v - minV) / (maxV - minV)); // 0..1
+  
     const lnMin = Math.log(minWindow);
     const lnMax = Math.log(maxWindow);
     const lnVal = lnMin + (lnMax - lnMin) * (1 - t);
     viewDurationSec = Math.exp(lnVal);
-
-    const maxStart = Math.max(0, duration - viewDurationSec);
+  
+    const span = Math.min(duration, maxViewSpanSec);
+    const maxStart = Math.max(0, span - viewDurationSec);
     viewStartSec = Math.min(Math.max(viewStartSec, 0), maxStart);
-
+  
     updateTimeLabel();
     updatePanThumb();
-
+  
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-    drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
   });
-
+  
   // --- Pan thumb dragging ------------------------------------------------
 
   panThumb.addEventListener("mousedown", (event) => {
@@ -288,12 +560,32 @@ function buildChannelControls(recording) {
 
   panTrack.addEventListener("mousedown", (event) => {
     if (!lastRecording) return;
-
+  
     const rect = panTrack.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const frac = x / Math.max(rect.width, 1);
-
-    panToFraction(frac);
+    const trackWidth = rect.width;
+    if (trackWidth <= 0) return;
+  
+    const duration = lastRecording.durationSec || 1;
+    const span = Math.min(duration, maxViewSpanSec);
+    const windowSpan = Math.min(viewDurationSec, span);
+    const maxStart = Math.max(0, span - windowSpan);
+  
+    const ratio = (span > 0) ? (windowSpan / span) : 1;
+    const thumbWidth = Math.max(10, trackWidth * ratio);
+    const travel = Math.max(1, trackWidth - thumbWidth);
+  
+    // click position, then convert to "thumb-left" so the thumb centers on the click
+    const clickX = event.clientX - rect.left;
+    const thumbLeft = Math.min(Math.max(clickX - thumbWidth / 2, 0), travel);
+    const frac = thumbLeft / travel; // 0..1 over travel
+  
+    viewStartSec = frac * maxStart;
+  
+    updateTimeLabel();
+    updatePanThumb();
+  
+    // keep pan/zoom fast: waveform only
+    drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
   });
 
   // --- Frequency range editing ------------------------------------------
@@ -378,13 +670,7 @@ function buildChannelControls(recording) {
   // --- Window resize handling -------------------------------------------
 
   window.addEventListener("resize", () => {
-    resizeCanvasToDisplaySize(waveformCanvas);
-    resizeCanvasToDisplaySize(spectrogramCanvas);
     updatePanThumb();
-    if (lastRecording) {
-      drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-      drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-    }
   });
 
   // --- Use a new Recording ----------------------------------------------
@@ -394,6 +680,7 @@ function buildChannelControls(recording) {
    * @param {Recording} recording
    */
   function useRecording(recording) {
+	viewerSections.classList.remove("hidden");
     lastRecording = recording;
 
     if (!recording || !recording.channels || recording.channels.length === 0) {
@@ -409,7 +696,7 @@ function buildChannelControls(recording) {
     }
 	if (saveViewButton) saveViewButton.disabled = false;
     buildChannelControls(lastRecording);
-
+	renderHypnogramFromSelection();
     maxViewSpanSec = lastRecording.durationSec || 10;
     if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
 
@@ -418,14 +705,23 @@ function buildChannelControls(recording) {
 
     zoomSlider.value = "0";
 
-    resizeCanvasToDisplaySize(waveformCanvas);
-    resizeCanvasToDisplaySize(spectrogramCanvas);
+	resizeCanvasToDisplaySize(waveformCanvas);
+	resizeCanvasToDisplaySize(spectrogramCanvas);
+	resizeCanvasToDisplaySize(hypnogramCanvas);   
 
     updateTimeLabel();
     updatePanThumb();
 
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
     drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+	setSectionLoading(hypnogramSection, true);
+	nextPaint().then(() => {
+	  try {
+		renderHypnogramFromSelection();
+	  } finally {
+		setSectionLoading(hypnogramSection, false);
+	  }
+	});
   }
 	if (saveViewButton) {
 	  saveViewButton.addEventListener("click", () => {
@@ -461,69 +757,74 @@ function buildChannelControls(recording) {
 
   // --- File handling ---------------------------------------------------
 
-  fileInput.addEventListener("change", (event) => {
-    const input = event.target;
-    if (!input.files || !input.files.length) {
-      fileInfo.textContent = "No file selected.";
-      return;
-    }
+  fileInput.addEventListener("change", async (event) => {
+	try{
 
-    const file = input.files[0];
-    const { name, size } = file;
-
-    fileInfo.textContent = `Selected file: ${name} (${(size / (1024 * 1024)).toFixed(2)} MB)`;
-
-	lastFileName = name;
-	if (saveViewButton) {
-	  saveViewButton.disabled = true; // will re-enable once recording is valid
+		const input = event.target;
+		if (!input.files || !input.files.length) {
+		fileInfo.textContent = "No file selected.";
+		return;
+		}
+	
+		const file = input.files[0];
+		setLoading(true);
+		await new Promise(requestAnimationFrame);
+		const { name, size } = file;
+	
+		fileInfo.textContent = `Selected file: ${name} (${(size / (1024 * 1024)).toFixed(2)} MB)`;
+	
+		lastFileName = name;
+		if (saveViewButton) {
+		saveViewButton.disabled = true; // will re-enable once recording is valid
+		}
+	
+		if (segmentLoader && size >= LARGE_FILE_THRESHOLD_BYTES) {
+		try {
+			const taken = segmentLoader.handleFile(file);
+			if (taken) {
+			fileInfo.textContent = "Loading large EDF segment…";
+			return; // Large loader will call onSegmentReady/useRecording later
+			}
+		} catch (err) {
+			console.warn("Segment loader failed, falling back:", err);
+		}
+		}
+	
+	
+		const reader = new FileReader();
+	
+		reader.onload = (ev) => {
+		try {
+			const arrayBuffer = ev.target.result;
+			const nameLower = (name || "").toLowerCase();
+	
+			if (nameLower.endsWith(".edf")) {
+			const recording = parseEdf(arrayBuffer);
+			useRecording(recording);
+			} else {
+			console.warn("Unknown format, using fake data for now");
+			const recording = createFakeRecording();
+			useRecording(recording);
+			}
+		} catch (err) {
+			console.error("Error parsing EDF:", err);
+			fileInfo.textContent = "Error parsing EDF file.";
+		}
+		};
+	
+		reader.onerror = (err) => {
+		console.error("Error reading file", err);
+		fileInfo.textContent = "Error reading file.";
+		};
+		reader.onloadend = () => {
+		  setLoading(false);
+		};
+		reader.readAsArrayBuffer(file);
+	}catch(err){
+		 console.error("Error parsing EDF:", err);
+		 setLoading(false);
 	}
-
-    if (segmentLoader && size >= LARGE_FILE_THRESHOLD_BYTES) {
-      try {
-        const taken = segmentLoader.handleFile(file);
-        if (taken) {
-          fileInfo.textContent = "Loading large EDF segment…";
-          return; // Large loader will call onSegmentReady/useRecording later
-        }
-      } catch (err) {
-        console.warn("Segment loader failed, falling back:", err);
-      }
-    }
-
-
-    const reader = new FileReader();
-
-    reader.onload = (ev) => {
-      try {
-        const arrayBuffer = ev.target.result;
-        const nameLower = (name || "").toLowerCase();
-
-        if (nameLower.endsWith(".edf")) {
-          const recording = parseEdf(arrayBuffer);
-          useRecording(recording);
-        } else {
-          console.warn("Unknown format, using fake data for now");
-          const recording = createFakeRecording();
-          useRecording(recording);
-        }
-      } catch (err) {
-        console.error("Error parsing EDF:", err);
-        fileInfo.textContent = "Error parsing EDF file.";
-      }
-    };
-
-    reader.onerror = (err) => {
-      console.error("Error reading file", err);
-      fileInfo.textContent = "Error reading file.";
-    };
-
-    reader.readAsArrayBuffer(file);
+	  
   });
 
-
-
-  // Initial dummy drawing so we see something
-  lastRecording = createFakeRecording();
-  drawWaveform(waveformCtx, waveformCanvas, lastRecording);
-  drawSpectrogram(spectrogramCtx,spectrogramCanvas,lastRecording);
 });

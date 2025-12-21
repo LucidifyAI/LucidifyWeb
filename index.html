@@ -35,10 +35,12 @@
 		  <div class="zoom-label">Zoom</div>
 		</div>
 
-		<div id="waveform-main">
-			<h3>Waveform</h3>
-			<div id="waveform-controls"></div>
-			<canvas id="waveform-canvas" width="800" height="240"></canvas>
+		<div id="waveform-section" class="viz-section">
+		  <div class="section-overlay hidden"><div class="loading-text">[...loading...]</div></div>
+
+		  <h3>Waveform</h3>
+		  <div id="waveform-controls"></div>
+		  <canvas id="waveform-canvas" width="800" height="240"></canvas>
 		</div>
 		</div>
 	
@@ -51,19 +53,59 @@
 	</div>
 	
 	<h3>Spectrogram</h3>
-	<div id="spectrogram-meta">
+
+	<div id="spectrogram-section" class="viz-section">
+	  <div class="section-overlay hidden"><div class="loading-text">[...loading...]</div></div>
+
+	  <div id="spectrogram-meta">
 		<span id="freq-range-label"></span>
+	  </div>
+
+		<div id="spectrogram-controls" class="controls-row">
+		  <button id="spectrogram-refresh-button" class="refresh-button" title="Refresh spectrogram" aria-label="Refresh spectrogram">⟳</button>
+		  <div id="spectrogram-channel-controls"></div>
+		</div>
+        <canvas id="spectrogram-canvas" width="800" height="240"></canvas>
 	</div>
-	<div id="spectrogram-controls"></div>
-	<canvas id="spectrogram-canvas" width="800" height="240"></canvas>
-	</section>
+
+	<h3>Hypnogram</h3>
+
+	<div id="hypnogram-section" class="viz-section">
+	  <div class="section-overlay hidden"><div class="loading-text">[...loading...]</div></div>
+		<div id="hypnogram-controls" class="controls-row">
+		  <button
+			id="hypnogram-refresh-button"
+			class="refresh-button"
+			title="Refresh hypnogram"
+			aria-label="Refresh hypnogram"
+		  >
+			⟳
+		  </button>
+
+		  <label class="hmm-toggle" title="Apply HMM smoothing">
+			<input type="checkbox" id="hypnogram-hmm-checkbox" checked />
+			<span>HMM</span>
+		  </label>
+
+		  <div id="hypnogram-channel-controls"></div>
+		</div>
+	  <canvas id="hypnogram-canvas" width="800" height="120"></canvas>
+	</div>
+
 
   </main>
-
+	<div id="loading-overlay" class="hidden">
+	  <div class="loading-text">[...loading...]</div>
+	</div>
 	<script src="edf_parser.js"></script>
 	<script src="renderers.js"></script>
 	<script src="large_edf_segment_loader.js"></script>
 	<script src="edf_writer.js"></script>
+
+	<script src="sleep_bundle.js"></script>
+	<script src="hypnogram_renderer.js"></script>
+
 	<script src="main.js"></script>
+
 </body>
 </html>

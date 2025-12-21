@@ -136,6 +136,7 @@
     const digMins = [];
     const digMaxs = [];
     const samplesPerRecord = [];
+	const physDims = [];
 
     for (let s = 0; s < nSignals; s++) {
       const label   = readAscii(bytes, labelsOffset           + 16 * s, 16);
@@ -144,13 +145,15 @@
       const digMin  = readNumber(bytes, digMinOffset          +  8 * s, 8);
       const digMax  = readNumber(bytes, digMaxOffset          +  8 * s, 8);
       const nSamp   = readNumber(bytes, samplesPerRecordOffset+  8 * s, 8);
-
-      labels.push(label || `Ch ${s + 1}`);
+	  const physDim = readAscii(bytes, physDimOffset + 8 * s, 8).trim();
+	  labels.push(label);
+	  physDims.push(physDim);
       physMins.push(physMin);
       physMaxs.push(physMax);
       digMins.push(digMin);
       digMaxs.push(digMax);
       samplesPerRecord.push(nSamp);
+
     }
 
     const bytesPerRecord =
@@ -183,7 +186,13 @@
       const denom = (digMax - digMin) || 1;
       const scale = (physMax - physMin) / denom;
       const baseVal = physMin - scale * digMin;
-
+	  const physDim = physDims[s] || "";
+	  let unitMul = 1.0;
+   
+   	  // normalize common EEG units to volts
+   	  if (physDim === "uV" || physDim === "µV") unitMul = 1e-6;
+   	  else if (physDim === "mV") unitMul = 1e-3;
+   	  // "V" -> 1.0
       let writeIndex = 0;
 
       for (let r = 0; r < records; r++) {
@@ -195,22 +204,21 @@
           const byteOffset = signalBase + i * 2;
           if (byteOffset + 1 >= bytes.length) break;
           const digit = dv.getInt16(byteOffset, true);
-          samples[writeIndex++] = baseVal + scale * digit;
+          samples[writeIndex++] = (baseVal + scale * digit);
         }
       }
 
       const fs = samplesPerRecord[s] / durationSecPerRecord;
-
       channels.push({
         name: labels[s],
         fs,
         samples,
+		physDim: physDims[s] || "",
       });
     }
 
     console.log("EDF parsed: channels =", channels.length,
                 "durationSec =", durationSec);
-
     const recording = {
       durationSec,
       channels
