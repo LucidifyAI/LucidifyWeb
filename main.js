@@ -779,15 +779,18 @@ function buildChannelControls(recording) {
 		}
 	
 		if (segmentLoader && size >= LARGE_FILE_THRESHOLD_BYTES) {
-		try {
+		  try {
 			const taken = segmentLoader.handleFile(file);
 			if (taken) {
-			fileInfo.textContent = "Loading large EDF segment…";
-			return; // Large loader will call onSegmentReady/useRecording later
+			  // IMPORTANT: global overlay must be off here, because FileReader won't run.
+			  setLoading(false);
+
+			  fileInfo.textContent = "Large EDF: choose channels/segment…";
+			  return; // Segment loader will call onSegmentReady later
 			}
-		} catch (err) {
+		  } catch (err) {
 			console.warn("Segment loader failed, falling back:", err);
-		}
+		  }
 		}
 	
 	

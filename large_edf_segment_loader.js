@@ -121,6 +121,7 @@
       this._overlay = null;
       this._channelContainer = null;
       this._startInput = null;
+	  this._fsSelect = null;
       this._durationInput = null;
       this._infoText = null;
       this._submitBtn = null;
@@ -220,7 +221,30 @@
 
       const durLabel = document.createElement("label");
       durLabel.textContent = "Duration (s): ";
-      const durInput = document.createElement("input");
+	  const fsLabel = document.createElement("label");
+	  fsLabel.textContent = "Downsample to: ";
+      const fsSelect = document.createElement("select");
+      fsSelect.style.background = "#222";
+      fsSelect.style.color = "#eee";
+      fsSelect.style.border = "1px solid #555";
+      const opts = [
+        { label: "No downsampling", value: "" },
+        { label: "256 Hz", value: "256" },
+        { label: "200 Hz", value: "200" },
+        { label: "128 Hz", value: "128" },
+        { label: "100 Hz", value: "100" },
+      ];
+      for (const o of opts) {
+        const opt = document.createElement("option");
+        opt.textContent = o.label;
+        opt.value = o.value;
+        fsSelect.appendChild(opt);
+      }
+      fsLabel.appendChild(fsSelect);
+      timeRow.appendChild(fsLabel);
+      // store handle
+      this._fsSelect = fsSelect;
+           const durInput = document.createElement("input");
       durInput.type = "number";
       durInput.step = "0.1";
       durInput.min = "0.1";
@@ -286,6 +310,7 @@
       this._overlay = overlay;
       this._channelContainer = channelContainer;
       this._startInput = startInput;
+	  this._fsSelect = fsSelect;
       this._durationInput = durInput;
       this._infoText = info;
       this._cancelBtn = cancelBtn;
@@ -351,6 +376,7 @@
 
       const checkboxes = this._channelContainer.querySelectorAll("input[type=checkbox]");
       const selectedIndices = [];
+	  const targetFs = this._fsSelect ? Number(this._fsSelect.value) : 0; // 0 => no downsample
       checkboxes.forEach((cb) => {
         if (cb.checked) {
           selectedIndices.push(Number(cb.value));
@@ -367,12 +393,12 @@
       this._cancelBtn.disabled = true;
       this._submitBtn.textContent = "Loading…";
 
-      this._loadSegment(startSec, durationSec, selectedIndices);
+      this._loadSegment(startSec, durationSec, selectedIndices, targetFs);
     }
 
     // ---------- Segment loading & decoding ----------
 
-      _loadSegment(startSec, windowSec, selectedIndices) {
+      _loadSegment(startSec, windowSec, selectedIndices, targetFs) {
       const file = this._currentFile;
       const info = this._headerInfo;
       if (!file || !info || !this._headerBytesRaw) return;
@@ -438,7 +464,9 @@
           this._currentFile = null;
           this._headerInfo = null;
           this._headerBytesRaw = null;
-
+			if (targetFs && Number.isFinite(targetFs) && targetFs > 0) {
+			  recording = downsampleRecording(recording, targetFs);
+			}
           this.onSegmentReady(recording);
         } catch (err) {
           console.error("Failed to decode EDF segment:", err);
@@ -481,3 +509,65 @@
   // Expose globally
   window.LargeEdfSegmentLoader = LargeEdfSegmentLoader;
 })();
+
+// Drop-in downsampling helpers (fast, browser-friendly)
+//
+// Design goals:
+// - Big speedup for high-Fs EDF (e.g., 500 Hz) without heavy DSP.
+// - Uses block-average + decimate (cheap low-pass-ish) to reduce aliasing.
+// - Handles any Float32Array length; preserves durationSec.
+//
+// Usage (after you decode a segment into a `recording` object):
+//   if (targetFs && targetFs > 0) recording = downsampleRecording(recording, targetFs);
+
+function downsampleChannel(ch, targetFs) {
+  if (!ch || !ch.samples || !Number.isFinite(ch.fs) || ch.fs <= 0) return ch;
+
+  const fsIn = ch.fs;
+  if (fsIn <= targetFs) return ch;
+
+  // Choose integer factor close to fsIn/targetFs.
+  // Example: 500->100 => factor=5, output fs=100
+  // Example: 512->100 => factor=5, output fs=102.4 (acceptable for UI/staging)
+  const factor = Math.max(1, Math.round(fsIn / targetFs));
+  if (factor <= 1) return ch;
+
+  const src = ch.samples;
+  const nOut = Math.floor(src.length / factor);
+  if (nOut <= 0) return ch;
+
+  const out = new Float32Array(nOut);
+
+  // Block-average (cheap smoothing) then decimate
+  // out[i] = mean(src[i*factor .. i*factor+factor-1])
+  for (let i = 0; i < nOut; i++) {
+    const base = i * factor;
+    let sum = 0;
+    // Unrolled loop not necessary; keep readable
+    for (let k = 0; k < factor; k++) sum += src[base + k];
+    out[i] = sum / factor;
+  }
+
+  // Return a new channel object so callers can treat channels as immutable
+  return {
+    ...ch,
+    fs: fsIn / factor,
+    samples: out,
+  };
+}
+
+function downsampleRecording(recording, targetFs) {
+  if (!recording || !Array.isArray(recording.channels) || !Number.isFinite(targetFs) || targetFs <= 0) {
+    return recording;
+  }
+
+  // Only downsample channels with fs > targetFs
+  const newChannels = recording.channels.map((ch) => downsampleChannel(ch, targetFs));
+
+  // durationSec remains unchanged; sample arrays are shorter and fs is reduced.
+  return {
+    ...recording,
+    channels: newChannels,
+  };
+}
+
