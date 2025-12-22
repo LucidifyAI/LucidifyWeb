@@ -80,10 +80,12 @@ window.addEventListener("DOMContentLoaded", () => {
     ? new window.LargeEdfSegmentLoader({
         thresholdBytes: LARGE_FILE_THRESHOLD_BYTES,
         onSegmentReady: (recording) => {
+          setLoading(false);
           fileInfo.textContent = "Loaded EDF segment.";
           useRecording(recording);
         },
         onCancelled: (reason) => {
+          setLoading(false);
           console.log("Large EDF segment load cancelled/failed:", reason);
           fileInfo.textContent = "Large EDF load cancelled.";
         }
