@@ -70,7 +70,7 @@ window.addEventListener("DOMContentLoaded", () => {
     setSectionLoading(hypnogramSection, true);
     await nextPaint();
     try {
-      renderHypnogramFromSelection(); // already window-sliced
+      await renderHypnogramFromSelection();
     } finally {
       setSectionLoading(hypnogramSection, false);
     }
@@ -155,6 +155,46 @@ window.addEventListener("DOMContentLoaded", () => {
     if (overlay) overlay.classList.toggle("hidden", !isLoading);
     sectionEl.classList.toggle("loading", isLoading);
   }
+
+
+  // --- Hypnogram model selector (Physio vs BOAS) --------------------------
+  // Requires sleep_stage.js (dynamic model loading). Falls back to baked model if only sleep_bundle.js is present.
+  function ensureHypnogramModelSelector() {
+	  console.log("ensureHypnogramModelSelector()", { hypnogramControls: !!hypnogramControls });
+    if (!hypnogramControls) return;
+    if (document.getElementById("hypnogram-model-physio")) return;
+
+    const wrap = document.createElement("div");
+    wrap.className = "hypnogram-model-controls";
+    wrap.innerHTML = `
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <span style="opacity:0.8;">Model:</span>
+        <label><input type="radio" id="hypnogram-model-physio" name="hypnogram-model" value="physio" checked> Physio</label>
+        <label><input type="radio" name="hypnogram-model" value="boas"> BOAS</label>
+      </div>
+    `;
+    hypnogramControls.prepend(wrap);
+console.log("model controls added", document.getElementById("hypnogram-model-physio"));
+
+    wrap.addEventListener("change", async () => {
+      if (!lastRecording) return;
+      setSectionLoading(hypnogramSection, true);
+      await nextPaint();
+      try {
+        await renderHypnogramFromSelection();
+      } finally {
+        setSectionLoading(hypnogramSection, false);
+      }
+    });
+  }
+
+  function getSelectedHypnogramModelUrl() {
+    const v =
+      document.querySelector('input[name="hypnogram-model"]:checked')?.value ||
+      "physio";
+    return v === "boas" ? "model_boas.json" : "model_physio.json";
+  }
+
   const loadingOverlay = document.getElementById("loading-overlay");
   
   function setLoading(isLoading) {
@@ -288,61 +328,74 @@ window.addEventListener("DOMContentLoaded", () => {
     return path;
   }
 
-  function renderHypnogramFromSelection() {
-    if (!lastRecording) return;
-  	resizeCanvasToDisplaySize(hypnogramCanvas);
-	hypnogramCanvas.height = 160; // enough vertical space for labels + steps
-	const ctx = hypnogramCanvas.getContext("2d");
-    ctx.clearRect(0, 0, hypnogramCanvas.width, hypnogramCanvas.height);
-    const indices = [];
-    for (let i = 0; i < hypnogramVisible.length; i++) {
-      if (hypnogramVisible[i]) indices.push(i);
-    }
-    if (indices.length === 0) return;
-  
-    const merged = mergeChannels(lastRecording, indices);
-	const samplesV_full = normalizeToVolts(merged.samples, merged.physDim);
-    const samplesV = sliceView(samplesV_full, merged.fs);
-	const fs = merged.fs;
+  async function renderHypnogramFromSelection() {
+  if (!lastRecording) return;
+  console.log("rendering hypnogram from selection");
+  ensureHypnogramModelSelector();
 
-	// Clamp window to available samples
-	const startSamp = Math.max(0, Math.floor(viewStartSec * fs));
-	const endSamp = Math.min(samplesV.length, Math.floor((viewStartSec + viewDurationSec) * fs));
+  resizeCanvasToDisplaySize(hypnogramCanvas);
+  hypnogramCanvas.height = 160;
+  const ctx = hypnogramCanvas.getContext("2d");
+  ctx.clearRect(0, 0, hypnogramCanvas.width, hypnogramCanvas.height);
 
-	// Ensure we have at least 1 epoch
-	const epochSamp = Math.floor(30 * fs);
-	let a = startSamp;
-	let b = endSamp;
-	if (b - a < epochSamp) {
-	  // pad window to at least 1 epoch if possible
-	  b = Math.min(samplesV.length, a + epochSamp);
-	  a = Math.max(0, b - epochSamp);
-	}
-
-	const windowSamples = samplesV.slice(a, b);
-
-	const { stages, probs } =
-    window.LucidifySleepStage.runFromSamples(samplesV, merged.fs, 30);
-	const hmmCb = document.getElementById("hypnogram-hmm-checkbox");
-	let stagesToDraw = stages;
-
-	if (hmmCb?.checked && Array.isArray(probs) && probs.length === stages.length) {
-	  // MODEL label order is the probs order (W,N1,N2,N3,REM)
-	  const labels = ["W","N1","N2","N3","REM"];
-	  stagesToDraw = viterbiSmoothSleepStages(probs, labels);
-	}
-	const counts = {};
-	for (const s of stages) counts[s] = (counts[s] || 0) + 1;
-  
-	const usableW = hypnogramCanvas.width;
-	const leftMargin = 60; // matches labelLeft layout
-	const epochWidth = Math.max(
-	  1,
-	  Math.floor((usableW - leftMargin) / stages.length)
-	);
-	window.renderHypnogramStep(hypnogramCanvas, stagesToDraw, { leftMargin: 80 });
+  const indices = [];
+  for (let i = 0; i < hypnogramVisible.length; i++) {
+    if (hypnogramVisible[i]) indices.push(i);
   }
-  
+  if (indices.length === 0) return;
+
+  const merged = mergeChannels(lastRecording, indices);
+  const fs = merged.fs;
+
+  const samplesV_full = normalizeToVolts(merged.samples, merged.physDim);
+
+  // Use current view window exactly once
+  let windowSamples = sliceView(samplesV_full, fs);
+
+  // Ensure at least 1 epoch (30s)
+  const epochSamp = Math.floor(30 * fs);
+  if (windowSamples.length < epochSamp) {
+    const centerSec = viewStartSec + viewDurationSec / 2;
+    const center = Math.floor(centerSec * fs);
+    let a = Math.max(0, center - Math.floor(epochSamp / 2));
+    let b = Math.min(samplesV_full.length, a + epochSamp);
+    a = Math.max(0, b - epochSamp);
+    windowSamples = samplesV_full.slice(a, b);
+  }
+
+  let stages, probs;
+
+  if (window.LucidifySleepStage?.run) {
+    const modelUrl = getSelectedHypnogramModelUrl();
+    ({ stages, probs } = await window.LucidifySleepStage.run(
+      {
+        channels: [{ name: "merged", fs, physDim: merged.physDim, samples: windowSamples }],
+        durationSec: windowSamples.length / fs,
+      },
+      { epochSec: 30, channelIndex: 0, modelUrl }
+    ));
+  } else if (window.LucidifySleepStage?.runFromSamples) {
+    const modelUrl = getSelectedHypnogramModelUrl();
+    ({ stages, probs } = await window.LucidifySleepStage.runFromSamples(
+      windowSamples,
+      fs,
+      { epochSec: 30, modelUrl }
+    ));
+  } else {
+    throw new Error("No sleep staging API found (LucidifySleepStage.run or runFromSamples).");
+  }
+
+  const hmmCb = document.getElementById("hypnogram-hmm-checkbox");
+  let stagesToDraw = stages;
+
+  if (hmmCb?.checked && Array.isArray(probs) && probs.length === stages.length) {
+    const labels = ["W", "N1", "N2", "N3", "REM"];
+    stagesToDraw = viterbiSmoothSleepStages(probs, labels);
+  }
+
+  window.renderHypnogramStep(hypnogramCanvas, stagesToDraw, { leftMargin: 80 });
+}
+
   
   // Pan thumb reflects which portion of the recording we’re viewing.
   function updatePanThumb() {
@@ -400,110 +453,124 @@ window.addEventListener("DOMContentLoaded", () => {
   /**
    * Rebuild the checkboxes for wave/spectrogram visibility.
    * @param {Recording} recording
-   */
-function buildChannelControls(recording) {
-  waveformControls.innerHTML = "";
-  spectrogramChannelControls.innerHTML = "";
-  hypnogramChannelControls.innerHTML = "";
-
-  const channels = recording.channels || [];
-  const n = channels.length;
-
-  // Start with all channels OFF…
-  waveformVisible = new Array(n).fill(false);
-  spectrogramVisible = new Array(n).fill(false);
-  hypnogramVisible = new Array(n).fill(false);
-
-  channels.forEach((ch, idx) => {
-    const name = ch.name || `Ch ${idx + 1}`;
-
-    // Only the first two channels visible initially
-    const defaultVisible = idx < 2;
-    waveformVisible[idx] = defaultVisible;
-    spectrogramVisible[idx] = defaultVisible;
-
-    // --- Waveform checkbox ---
-    const wLabel = document.createElement("label");
-    const wCb = document.createElement("input");
-    wCb.type = "checkbox";
-    wCb.checked = defaultVisible;
-    wCb.addEventListener("change", async () => {
+     */
+  function buildChannelControls(recording) {
+    waveformControls.innerHTML = "";
+    spectrogramChannelControls.innerHTML = "";
+    hypnogramChannelControls.innerHTML = "";
+  
+  
+    // Bind HMM toggle once (do not bind inside channel loop)
+    const hmmCbGlobal = document.getElementById("hypnogram-hmm-checkbox");
+    if (hmmCbGlobal && !hmmCbGlobal.dataset.bound) {
+      hmmCbGlobal.dataset.bound = "1";
+      hmmCbGlobal.addEventListener("change", async () => {
+        if (!lastRecording) return;
+        setSectionLoading(hypnogramSection, true);
+        await nextPaint();
+        try {
+          await renderHypnogramFromSelection();
+        } finally {
+          setSectionLoading(hypnogramSection, false);
+        }
+      });
+    }
+  
+    const channels = recording.channels || [];
+    const n = channels.length;
+  
+    // Start with all channels OFF…
+    waveformVisible = new Array(n).fill(false);
+    spectrogramVisible = new Array(n).fill(false);
+    hypnogramVisible = new Array(n).fill(false);
+  
+    channels.forEach((ch, idx) => {
+      const name = ch.name || `Ch ${idx + 1}`;
+  
+      // Only the first two channels visible initially
+      const defaultVisible = idx < 2;
+      waveformVisible[idx] = defaultVisible;
+      spectrogramVisible[idx] = defaultVisible;
+  
+      // --- Waveform checkbox ---
+      const wLabel = document.createElement("label");
+      const wCb = document.createElement("input");
+      wCb.type = "checkbox";
+      wCb.checked = defaultVisible;
+      wCb.addEventListener("change", async () => {  
 	  waveformVisible[idx] = wCb.checked;
-
-	  setSectionLoading(waveformSection, true);
-	  await nextPaint();
-	  try {
-		drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
-	  } finally {
-		setSectionLoading(waveformSection, false);
-	  }
+  
+	  setSectionLoading(waveformSection, true);  
+	  await nextPaint();  
+	  try {  
+		drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);  
+	  } finally {  
+		setSectionLoading(waveformSection, false);  
+	  }  
 	});
-    wLabel.appendChild(wCb);
-    wLabel.appendChild(document.createTextNode(" " + name));
-    waveformControls.appendChild(wLabel);
-    waveformControls.appendChild(document.createElement("br"));
-
-    // --- Spectrogram checkbox ---
-    const sLabel = document.createElement("label");
-    const sCb = document.createElement("input");
-    sCb.type = "checkbox";
-    sCb.checked = defaultVisible;
-    sCb.addEventListener("change", async () => {
-      spectrogramVisible[idx] = sCb.checked;
-
-	  setSectionLoading(spectrogramSection, true);
-	  await nextPaint();
-	  try {
-		drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
-	  } finally {
-		setSectionLoading(spectrogramSection, false);
+      wLabel.appendChild(wCb);
+      wLabel.appendChild(document.createTextNode(" " + name));
+      waveformControls.appendChild(wLabel);
+      waveformControls.appendChild(document.createElement("br"));
+  
+      // --- Spectrogram checkbox ---
+      const sLabel = document.createElement("label");
+      const sCb = document.createElement("input");
+      sCb.type = "checkbox";
+      sCb.checked = defaultVisible;
+      sCb.addEventListener("change", async () => {
+        spectrogramVisible[idx] = sCb.checked;
+  
+	  setSectionLoading(spectrogramSection, true);  
+	  await nextPaint();  
+	  try {  
+		drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);  
+	  } finally {  
+		setSectionLoading(spectrogramSection, false);  
 	  }
-    });
-    sLabel.appendChild(sCb);
-    sLabel.appendChild(document.createTextNode(" " + name));
-    spectrogramChannelControls.appendChild(sLabel);
-    spectrogramChannelControls.appendChild(document.createElement("br"));
-	
-	// --- Hypnogram checkbox ---
-	// sensible default: first EEG-like channel ON
-	const hLabel = document.createElement("label");
-	const hCb = document.createElement("input");
-	hCb.type = "checkbox";
-	const defaultHypno = idx === 0;
-	hCb.checked = defaultHypno;
+      });
+      sLabel.appendChild(sCb);
+      sLabel.appendChild(document.createTextNode(" " + name));
+      spectrogramChannelControls.appendChild(sLabel);
+      spectrogramChannelControls.appendChild(document.createElement("br"));  
+	  
+	// --- Hypnogram checkbox ---  
+	// sensible default: first EEG-like channel ON  
+	const hLabel = document.createElement("label");  
+	const hCb = document.createElement("input");  
+	hCb.type = "checkbox";  
+	const defaultHypno = idx === 0;  
+	hCb.checked = defaultHypno;  
 	hypnogramVisible[idx] = defaultHypno;
-
-	hCb.addEventListener("change", async () => {
+  
+	hCb.addEventListener("change", async () => {  
 	  hypnogramVisible[idx] = hCb.checked;
-
-	  setSectionLoading(hypnogramSection, true);
-	  await nextPaint();
-	  try {
-		renderHypnogramFromSelection();
-	  } finally {
-		setSectionLoading(hypnogramSection, false);
-	  }
+  
+	  setSectionLoading(hypnogramSection, true);  
+	  await nextPaint();  
+	  try {  
+		await renderHypnogramFromSelection();
+      } finally {  
+		setSectionLoading(hypnogramSection, false);  
+	  }  
 	});
-	document
-	  .getElementById("hypnogram-hmm-checkbox")
-	  ?.addEventListener("change", () => {
-		if (!lastRecording) return;
-		setSectionLoading(hypnogramSection, true);
-		nextPaint().then(() => {
-		  try { renderHypnogramFromSelection(); }
-		  finally { setSectionLoading(hypnogramSection, false); }
-		});
-	  });
-	hLabel.appendChild(hCb);
-	hLabel.appendChild(
-	  document.createTextNode(` ${ch.name}${ch.physDim ? " (" + ch.physDim + ")" : ""}`)
-	);
-	hypnogramChannelControls.appendChild(hLabel);
+    nextPaint().then(async () => {
+        try {
+          await renderHypnogramFromSelection();
+        } finally {
+          setSectionLoading(hypnogramSection, false);
+        }
+      });   
+	hLabel.appendChild(hCb);  
+	hLabel.appendChild(  
+	  document.createTextNode(` ${ch.name}${ch.physDim ? " (" + ch.physDim + ")" : ""}`)  
+	);  
+	hypnogramChannelControls.appendChild(hLabel);  
 	hypnogramChannelControls.appendChild(document.createElement("br"));
-  });
-}
-
-
+    });
+  }
+  
+  
   // --- Zoom slider -------------------------------------------------------
 
   zoomSlider.addEventListener("input", () => {
@@ -698,7 +765,6 @@ function buildChannelControls(recording) {
     }
 	if (saveViewButton) saveViewButton.disabled = false;
     buildChannelControls(lastRecording);
-	renderHypnogramFromSelection();
     maxViewSpanSec = lastRecording.durationSec || 10;
     if (maxViewSpanSec <= 0) maxViewSpanSec = 10;
 
@@ -717,13 +783,13 @@ function buildChannelControls(recording) {
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
     drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
 	setSectionLoading(hypnogramSection, true);
-	nextPaint().then(() => {
-	  try {
-		renderHypnogramFromSelection();
-	  } finally {
-		setSectionLoading(hypnogramSection, false);
-	  }
-	});
+	nextPaint().then(async () => {
+      try {
+        await renderHypnogramFromSelection();
+      } finally {
+        setSectionLoading(hypnogramSection, false);
+      }
+    });
   }
 	if (saveViewButton) {
 	  saveViewButton.addEventListener("click", () => {
