@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reference Overlay Help</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; line-height: 1.45; }
+    code { background: rgba(0,0,0,0.06); padding: 0 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Reference Overlay Help</h1>
+
+  <p><b>What it does:</b> The “Load Ref” button overlays a reference hypnogram on top of the currently selected model output for the visible time window. The console prints accuracy and Cohen’s kappa over overlapping (non-null) epochs.</p>
+
+  <h2>Supported reference formats</h2>
+  <ul>
+    <li><b>PhysioNet Sleep-EDF:</b> <code>*-Hypnogram.edf</code> (EDF+ annotations)</li>
+    <li><b>OpenNeuro / BIDS:</b> <code>*_events.tsv</code> (prefers <code>stage_hum</code> if present; falls back to <code>stage_ai</code>)</li>
+  </ul>
+
+  <h2>How alignment works</h2>
+  <ul>
+    <li>Epoch length is assumed to be <b>30 seconds</b>.</li>
+    <li>Overlay alignment uses the current view window start time to slice reference epochs.</li>
+    <li>If the reference events start at a different origin than the EDF, the overlay may appear shifted.</li>
+  </ul>
+
+  <h2>Common troubleshooting</h2>
+  <ul>
+    <li><b>No overlay visible:</b> confirm the ref file parsed to a non-empty stage array (check console for unique stages).</li>
+    <li><b>Looks shifted:</b> try comparing PSG EDF with PSG events (same acquisition) before cross-device comparisons.</li>
+    <li><b>HMM effects:</b> compare with HMM on/off; smoothing changes predicted stages only.</li>
+  </ul>
+</body>
+</html>
