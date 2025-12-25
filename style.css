@@ -128,10 +128,8 @@ section {
 }
 
 /* main waveform area to the right of zoom slider */
-#waveform-main {
-  flex: 1;
-}
-
+#waveform-section { flex: 1; }
+#waveform-canvas { height: 240px; }
 /* pan bar under waveform */
 
 #pan-row {

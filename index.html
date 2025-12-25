@@ -23,7 +23,7 @@
 	  <button id="save-view-button" disabled>Save view as EDF</button>
     </section>
 
-	<section id="views">
+	<section id="views" class="hidden">
 	<h2>Views</h2>
 	
 	<div id="waveform-container">
@@ -40,7 +40,7 @@
 
 		  <h3>Waveform</h3>
 		  <div id="waveform-controls"></div>
-		  <canvas id="waveform-canvas" width="800" height="240"></canvas>
+		  <canvas id="waveform-canvas"></canvas>
 		</div>
 		</div>
 	
@@ -95,7 +95,7 @@
 		  </div>
 	</div>
 
-
+</section>
   </main>
 	<div id="loading-overlay" class="hidden">
 	  <div class="loading-text">[...loading...]</div>
@@ -107,8 +107,18 @@
 
 	<script src="sleep_models_embedded.js"></script>
 	<script src="sleep_local_bundle.js"></script>
-
+    <script src="hypnogram_reference.js"></script>
 	<script src="hypnogram_renderer.js"></script>
+	<!-- YASA engine (new set) -->
+	<script src="yasa/yasa_model_dump_embedded.js"></script>
+	<script src="yasa/yasa_dsp.js"></script>
+	<script src="yasa/yasa_features.js"></script>
+	<script src="yasa/yasa_lgbm.js"></script>
+	<script src="yasa/yasa_staging.js"></script>
+
+	<!-- Adapter that defines window.LucidifyYasaSleepStage -->
+	<script src="yasa/yasa_sleep_stage.js"></script>
+
 	<script src="main.js"></script>
 
 </body>

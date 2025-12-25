@@ -162,6 +162,93 @@ function renderHypnogramStep(canvas, stages, options = {}) {
 
   ctx.stroke();
 }
+function renderHypnogramStepOverlay(canvas, stages, options = {}) {
+  const ctx = canvas.getContext("2d");
+
+  const padding = options.padding ?? 10;
+  const leftMargin = options.leftMargin ?? 80;
+  const lineWidth = options.lineWidth ?? 2;
+
+  // Style controls for overlay
+  const strokeStyle = options.strokeStyle ?? "rgba(255,255,255,0.70)";
+  const dash = options.dash ?? [6, 4];           // dashed overlay
+  const drawLabels = options.drawLabels ?? false; // usually false for overlay
+  const drawGrid = options.drawGrid ?? false;     // usually false for overlay
+
+  // Stage order (top to bottom) must match renderHypnogramStep
+  const order = ["W", "REM", "N1", "N2", "N3"];
+  const stageToLevel = new Map(order.map((s, i) => [s, i]));
+
+  const W = canvas.width;
+  const H = canvas.height;
+
+  // Plot bounds must match renderHypnogramStep
+  const plotTop = padding;
+  const plotBottom = H - padding;
+  const plotLeft = leftMargin;
+  const plotRight = W - padding;
+
+  const nLevels = order.length;
+  const dy = (plotBottom - plotTop) / (nLevels - 1);
+
+  function yForStage(stage) {
+    const level = stageToLevel.has(stage) ? stageToLevel.get(stage) : stageToLevel.get("W");
+    return plotTop + level * dy;
+  }
+
+  // Optional labels/grid (off by default for overlay)
+  if (drawGrid || drawLabels) {
+    ctx.save();
+    ctx.font = "12px sans-serif";
+    ctx.textBaseline = "middle";
+    if (drawLabels) ctx.fillStyle = "#bbb";
+
+    for (let i = 0; i < nLevels; i++) {
+      const y = plotTop + i * dy;
+      if (drawLabels) ctx.fillText(order[i], 10, y);
+
+      if (drawGrid) {
+        ctx.strokeStyle = "rgba(255,255,255,0.08)";
+        ctx.beginPath();
+        ctx.moveTo(plotLeft, y);
+        ctx.lineTo(plotRight, y);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  if (!stages || stages.length === 0) return;
+
+  // X scaling: fit all epochs into available width
+  const n = stages.length;
+  const dx = (plotRight - plotLeft) / Math.max(1, n - 1);
+
+  // Draw step path on top (no clearRect)
+  ctx.save();
+  ctx.strokeStyle = strokeStyle;
+  ctx.lineWidth = lineWidth;
+  ctx.setLineDash(dash);
+
+  ctx.beginPath();
+  let x = plotLeft;
+  let y = yForStage(stages[0]);
+  ctx.moveTo(x, y);
+
+  for (let i = 1; i < n; i++) {
+    const x2 = plotLeft + i * dx;
+    const y2 = yForStage(stages[i]);
+    ctx.lineTo(x2, y);
+    ctx.lineTo(x2, y2);
+    x = x2;
+    y = y2;
+  }
+
+  ctx.stroke();
+  ctx.restore();
+}
+
+window.renderHypnogramStepOverlay = renderHypnogramStepOverlay;
 
 window.renderHypnogramStep = renderHypnogramStep;
 

@@ -111,6 +111,7 @@ window.addEventListener("DOMContentLoaded", () => {
   let waveformVisible = [];
   let spectrogramVisible = [];
   let hypnogramVisible = [];
+  let referenceHypno = null;
   
   // shared view window (seconds)
   let viewStartSec = 0;
@@ -156,44 +157,131 @@ window.addEventListener("DOMContentLoaded", () => {
     sectionEl.classList.toggle("loading", isLoading);
   }
 
+function redrawWaveform() {
+  if (!lastRecording) return;
 
-  // --- Hypnogram model selector (Physio vs BOAS) --------------------------
-  // Requires sleep_stage.js (dynamic model loading). Falls back to baked model if only sleep_bundle.js is present.
-  function ensureHypnogramModelSelector() {
-	  console.log("ensureHypnogramModelSelector()", { hypnogramControls: !!hypnogramControls });
-    if (!hypnogramControls) return;
-    if (document.getElementById("hypnogram-model-physio")) return;
+  // IMPORTANT: update backing-store size to match CSS size
+  resizeCanvasToDisplaySize(waveformCanvas);
 
-    const wrap = document.createElement("div");
-    wrap.className = "hypnogram-model-controls";
-    wrap.innerHTML = `
-      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-        <span style="opacity:0.8;">Model:</span>
-        <label><input type="radio" id="hypnogram-model-physio" name="hypnogram-model" value="physio" checked> Physio</label>
-        <label><input type="radio" name="hypnogram-model" value="boas"> BOAS</label>
-      </div>
-    `;
-    hypnogramControls.prepend(wrap);
-console.log("model controls added", document.getElementById("hypnogram-model-physio"));
+  // Draw using current viewStartSec/viewDurationSec (your renderer reads bound state)
+  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+}
+let resizeRAF = 0;
+window.addEventListener("resize", () => {
+  if (resizeRAF) cancelAnimationFrame(resizeRAF);
+  resizeRAF = requestAnimationFrame(() => {
+    resizeRAF = 0;
 
-    wrap.addEventListener("change", async () => {
-      if (!lastRecording) return;
-      setSectionLoading(hypnogramSection, true);
-      await nextPaint();
-      try {
-        await renderHypnogramFromSelection();
-      } finally {
-        setSectionLoading(hypnogramSection, false);
-      }
+    updatePanThumb();
+
+    if (!lastRecording) return;
+
+    resizeCanvasToDisplaySize(waveformCanvas);
+    drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+
+    // Optional (heavier): only if you want them to stay crisp on resize
+    // resizeCanvasToDisplaySize(spectrogramCanvas);
+    // drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
+    // resizeCanvasToDisplaySize(hypnogramCanvas);
+    // renderHypnogramFromSelection();
+  });
+});
+  // --- Hypnogram model selector (Physio vs BOAS vs YASA) ----------------------
+function ensureHypnogramModelSelector() {
+  if (!hypnogramControls) return;
+  if (document.getElementById("hypnogram-model-physio")) return;
+
+  const wrap = document.createElement("div");
+  wrap.className = "hypnogram-model-controls";
+  wrap.innerHTML = `
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <span style="opacity:0.8;">Model:</span>
+      <label><input type="radio" id="hypnogram-model-physio" name="hypnogram-model" value="physio" checked> Physio</label>
+      <label><input type="radio" name="hypnogram-model" value="boas"> BOAS</label>
+      <label><input type="radio" name="hypnogram-model" value="yasa"> YASA</label>
+  
+      <span style="width:16px;"></span>
+  
+      <button id="hypnogram-load-ref" type="button" title="Load a reference hypnogram (EDF/TSV)">Load Ref</button>
+      <button id="hypnogram-clear-ref" type="button" title="Clear reference overlay">Clear Ref</button>
+      <input id="hypnogram-ref-input" type="file" accept=".edf,.tsv" style="display:none" />
+    </div>
+  `;
+  hypnogramControls.prepend(wrap);
+  const refBtn   = wrap.querySelector("#hypnogram-load-ref");
+  const clrBtn   = wrap.querySelector("#hypnogram-clear-ref");
+  const refInput = wrap.querySelector("#hypnogram-ref-input");
+  refBtn?.addEventListener("click", () => refInput?.click());
+
+  clrBtn?.addEventListener("click", async () => {
+    referenceHypno = null;
+    if (!lastRecording) return;
+    setSectionLoading(hypnogramSection, true);
+    await nextPaint();
+    try { await renderHypnogramFromSelection(); }
+    finally { setSectionLoading(hypnogramSection, false); }
+  });
+  
+  refInput?.addEventListener("change", async (ev) => {
+    const f = ev.target.files?.[0];
+    if (!f) return;
+  
+    const nameLower = (f.name || "").toLowerCase();
+  
+    const buf = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsArrayBuffer(f);
     });
-  }
+  
+    if (nameLower.endsWith(".edf")) {
+		referenceHypno = window.HYPNO_REF.parseSleepEdfHypnogramFromArrayBuffer(buf, {
+		  epochSec: 30,
+		  mapToAasm: true,
+		  totalDurationSec: Number(lastRecording?.durationSec) || null,
+		});
+      referenceHypno.sourceName = f.name;
+    } else if (nameLower.endsWith(".tsv")) {
+		const tsvText = new TextDecoder("utf-8").decode(new Uint8Array(buf));
+	referenceHypno = window.HYPNO_REF.parseBidsEventsTsvToHypnogram(tsvText, {
+	epochSec: 30,
+	totalDurationSec: lastRecording?.durationSec,
+	fs: lastRecording?.channels?.[0]?.fs, // if you want begsample alignment
+	preferSamples: true,
+	// stageColumn: "stage_hum", // optional override
+	sourceName: f.name,
+	});
+    } else {
+      throw new Error("Unsupported ref hypnogram format (use .edf or .tsv).");
+    }
+    if (!lastRecording) return;
+    setSectionLoading(hypnogramSection, true);
+    await nextPaint();
+    try { await renderHypnogramFromSelection(); }
+    finally { setSectionLoading(hypnogramSection, false); refInput.value = "";  }
+  });
+  wrap.addEventListener("change", async () => {
+    if (!lastRecording) return;
+    setSectionLoading(hypnogramSection, true);
+    await nextPaint();
+    try {
+      await renderHypnogramFromSelection();
+    } finally {
+      setSectionLoading(hypnogramSection, false);
+    }
+  });
+}
 
-  function getSelectedHypnogramModelUrl() {
-    const v =
-      document.querySelector('input[name="hypnogram-model"]:checked')?.value ||
-      "physio";
-    return v === "boas" ? "model_boas.json" : "model_physio.json";
-  }
+function getSelectedHypnogramModelUrl() {
+  const v =
+    document.querySelector('input[name="hypnogram-model"]:checked')?.value ||
+    "physio";
+
+  if (v === "boas") return "model_boas.json";
+  if (v === "yasa") return "model_yasa.json";
+  return "model_physio.json";
+}
 
   const loadingOverlay = document.getElementById("loading-overlay");
   
@@ -327,76 +415,127 @@ console.log("model controls added", document.getElementById("hypnogram-model-phy
     }
     return path;
   }
-
-  async function renderHypnogramFromSelection() {
-  if (!lastRecording) return;
-  console.log("rendering hypnogram from selection");
-  ensureHypnogramModelSelector();
-
-  resizeCanvasToDisplaySize(hypnogramCanvas);
-  hypnogramCanvas.height = 160;
-  const ctx = hypnogramCanvas.getContext("2d");
-  ctx.clearRect(0, 0, hypnogramCanvas.width, hypnogramCanvas.height);
-
-  const indices = [];
-  for (let i = 0; i < hypnogramVisible.length; i++) {
-    if (hypnogramVisible[i]) indices.push(i);
-  }
-  if (indices.length === 0) return;
-
-  const merged = mergeChannels(lastRecording, indices);
-  const fs = merged.fs;
-
-  const samplesV_full = normalizeToVolts(merged.samples, merged.physDim);
-
-  // Use current view window exactly once
-  let windowSamples = sliceView(samplesV_full, fs);
-
-  // Ensure at least 1 epoch (30s)
-  const epochSamp = Math.floor(30 * fs);
-  if (windowSamples.length < epochSamp) {
-    const centerSec = viewStartSec + viewDurationSec / 2;
-    const center = Math.floor(centerSec * fs);
-    let a = Math.max(0, center - Math.floor(epochSamp / 2));
-    let b = Math.min(samplesV_full.length, a + epochSamp);
-    a = Math.max(0, b - epochSamp);
-    windowSamples = samplesV_full.slice(a, b);
-  }
-
-  let stages, probs;
-
-  if (window.LucidifySleepStage?.run) {
-    const modelUrl = getSelectedHypnogramModelUrl();
-    ({ stages, probs } = await window.LucidifySleepStage.run(
-      {
-        channels: [{ name: "merged", fs, physDim: merged.physDim, samples: windowSamples }],
-        durationSec: windowSamples.length / fs,
-      },
-      { epochSec: 30, channelIndex: 0, modelUrl }
-    ));
-  } else if (window.LucidifySleepStage?.runFromSamples) {
-    const modelUrl = getSelectedHypnogramModelUrl();
-    ({ stages, probs } = await window.LucidifySleepStage.runFromSamples(
-      windowSamples,
-      fs,
-      { epochSec: 30, modelUrl }
-    ));
-  } else {
-    throw new Error("No sleep staging API found (LucidifySleepStage.run or runFromSamples).");
-  }
-
-  const hmmCb = document.getElementById("hypnogram-hmm-checkbox");
-  let stagesToDraw = stages;
-
-  if (hmmCb?.checked && Array.isArray(probs) && probs.length === stages.length) {
-    const labels = ["W", "N1", "N2", "N3", "REM"];
-    stagesToDraw = viterbiSmoothSleepStages(probs, labels);
-  }
-
-  window.renderHypnogramStep(hypnogramCanvas, stagesToDraw, { leftMargin: 80 });
-}
-
+ 
+//---------------------------------------------------------------------------
+//---------------------RenderHypnogramFromSelection
+async function renderHypnogramFromSelection() {
+    if (!lastRecording) return;
+    console.log("rendering hypnogram from selection");
+    ensureHypnogramModelSelector();
   
+    resizeCanvasToDisplaySize(hypnogramCanvas);
+    hypnogramCanvas.height = 160;
+    const ctx = hypnogramCanvas.getContext("2d");
+    ctx.clearRect(0, 0, hypnogramCanvas.width, hypnogramCanvas.height);
+  
+    const indices = [];
+    for (let i = 0; i < hypnogramVisible.length; i++) {
+      if (hypnogramVisible[i]) indices.push(i);
+    }
+    if (indices.length === 0) return;
+  
+    const merged = mergeChannels(lastRecording, indices);
+    const fs = merged.fs;
+    
+    // Keep original units for YASA
+    const samplesNative_full = merged.samples;      // in merged.physDim (often µV)
+    // Keep volts for Lucidify LR models
+    const samplesV_full = normalizeToVolts(samplesNative_full, merged.physDim);
+    
+    // Slice both using the same indices
+    let windowSamplesNative = sliceView(samplesNative_full, fs);
+    let windowSamplesV      = sliceView(samplesV_full, fs);
+    let windowStartSecUsed = viewStartSec;
+    let windowSamples = sliceView(samplesV_full, fs);
+    // Ensure at least 1 epoch (apply same a/b to both)
+    const epochSamp = Math.floor(30 * fs);
+    if (windowSamplesV.length < epochSamp) {
+      const centerSec = viewStartSec + viewDurationSec / 2;
+      const center = Math.floor(centerSec * fs);
+      let a = Math.max(0, center - Math.floor(epochSamp / 2));
+      let b = Math.min(samplesV_full.length, a + epochSamp);
+      a = Math.max(0, b - epochSamp);
+    
+      windowSamplesV      = samplesV_full.slice(a, b);
+      windowSamplesNative = samplesNative_full.slice(a, b);
+  	windowStartSecUsed = a / fs;
+    }
+  
+    const selected =
+      document.querySelector('input[name="hypnogram-model"]:checked')?.value || "physio";
+  
+    let stages, probs;
+  
+    if (selected === "yasa") {
+      if (!window.LucidifyYasaSleepStage?.runFromSamples) {
+        throw new Error("YASA selected, but LucidifyYasaSleepStage is not loaded.");
+      }
+      ({ stages, probs } = await window.LucidifyYasaSleepStage.runFromSamples(
+        windowSamplesNative, fs, { epochSec: 30, physDim: merged.physDim }
+      ));
+    } else if (window.LucidifySleepStage?.run) {
+      const modelUrl = getSelectedHypnogramModelUrl();
+      ({ stages, probs } = await window.LucidifySleepStage.run(
+        {
+          channels: [{ name: "merged", fs, physDim: merged.physDim, samples: windowSamplesV }],
+          durationSec: windowSamplesV.length / fs,
+        },
+        { epochSec: 30, channelIndex: 0, modelUrl }
+      ));
+    } else if (window.LucidifySleepStage?.runFromSamples) {
+      const modelUrl = getSelectedHypnogramModelUrl();
+      ({ stages, probs } = await window.LucidifySleepStage.runFromSamples(
+        windowSamplesV,
+        fs,
+        { epochSec: 30, modelUrl }
+      ));
+    } else {
+      throw new Error("No sleep staging API found (LucidifySleepStage.run or runFromSamples).");
+    }
+  
+    const hmmCb = document.getElementById("hypnogram-hmm-checkbox");
+    let stagesToDraw = stages;
+  
+    if (hmmCb?.checked && Array.isArray(probs) && probs.length === stages.length) {
+      const labels = ["W", "N1", "N2", "N3", "REM"];
+      stagesToDraw = viterbiSmoothSleepStages(probs, labels);
+    }
+  
+    window.renderHypnogramStep(hypnogramCanvas, stagesToDraw, { leftMargin: 80 });
+    
+    if (referenceHypno?.stages?.length) {
+      const epochSec = referenceHypno.epochSec || 30;
+      const startEpoch = Math.floor(windowStartSecUsed / epochSec);
+      const refSlice = referenceHypno.stages.slice(startEpoch, startEpoch + stagesToDraw.length);
+    
+      // Overlay using same coordinate mapping + step style as the base renderer
+		window.renderHypnogramStepOverlay(hypnogramCanvas, refSlice, {
+		  leftMargin: 80,
+		  lineWidth: 2,
+		  dash: [], // solid
+		  strokeStyle: "rgba(255, 255, 0, .5)", 
+		});
+    
+      const m = window.HYPNO_REF.compareStages(stagesToDraw, refSlice);
+      console.log(
+        `Ref compare (${referenceHypno.sourceName || "ref"}): ` +
+        `N=${m.N} acc=${(m.acc * 100).toFixed(1)}% kappa=${m.kappa.toFixed(3)}`
+      );
+    }
+  }
+//------------------------------------------------------------------------------------------
+  function stageToY(stage) {
+    // Matches your label order W, REM, N1, N2, N3 (top -> bottom)
+    if (stage === "W") return 0;
+    if (stage === "REM") return 1;
+    if (stage === "N1") return 2;
+    if (stage === "N2") return 3;
+    if (stage === "N3") return 4;
+    return null;
+  }
+  
+
+
   // Pan thumb reflects which portion of the recording we’re viewing.
   function updatePanThumb() {
     if (!lastRecording || !panTrack) return;
@@ -554,13 +693,7 @@ console.log("model controls added", document.getElementById("hypnogram-model-phy
 		setSectionLoading(hypnogramSection, false);  
 	  }  
 	});
-    nextPaint().then(async () => {
-        try {
-          await renderHypnogramFromSelection();
-        } finally {
-          setSectionLoading(hypnogramSection, false);
-        }
-      });   
+
 	hLabel.appendChild(hCb);  
 	hLabel.appendChild(  
 	  document.createTextNode(` ${ch.name}${ch.physDim ? " (" + ch.physDim + ")" : ""}`)  
@@ -736,12 +869,6 @@ console.log("model controls added", document.getElementById("hypnogram-model-phy
     });
   });
 
-  // --- Window resize handling -------------------------------------------
-
-  window.addEventListener("resize", () => {
-    updatePanThumb();
-  });
-
   // --- Use a new Recording ----------------------------------------------
 
   /**
@@ -781,6 +908,12 @@ console.log("model controls added", document.getElementById("hypnogram-model-phy
     updatePanThumb();
 
     drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+
+	// one extra pass after layout settles
+	requestAnimationFrame(() => {
+	  resizeCanvasToDisplaySize(waveformCanvas);
+	  drawWaveform(waveformCtx, waveformCanvas, lastRecording, waveformVisible);
+	});
     drawSpectrogram(spectrogramCtx, spectrogramCanvas, lastRecording, spectrogramVisible);
 	setSectionLoading(hypnogramSection, true);
 	nextPaint().then(async () => {
