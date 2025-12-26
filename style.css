@@ -126,7 +126,29 @@ section {
   color: #ccc;
   margin: 0;
 }
+.white_paper {
+  font-size: 0.8rem;
+  color: #ddd;
+  font-style: italic;
+}
 
+.white_paper a,
+.white_paper a:visited,
+.white_paper a:hover,
+.white_paper a:active,
+.white_paper a:focus {
+  color: #b3b3b3;
+}
+.white_paper a,
+.white_paper a:visited {
+  text-decoration: none;
+}
+
+/* optional: show underline only on hover/focus */
+.white_paper a:hover,
+.white_paper a:focus {
+  text-decoration: underline;
+}
 /* main waveform area to the right of zoom slider */
 #waveform-section { flex: 1; }
 #waveform-canvas { height: 240px; }
