@@ -132,7 +132,12 @@ window.addEventListener("DOMContentLoaded", () => {
   const waveformSection = document.getElementById("waveform-section");
   const spectrogramSection = document.getElementById("spectrogram-section");
   const hypnogramSection = document.getElementById("hypnogram-section");
-
+  let flipSecondChannelVert = false;
+  const flipSecondChannelVertRef = {
+    get value() { return flipSecondChannelVert; },
+    set value(v) { flipSecondChannelVert = !!v; }
+  };
+flipSecondChannelVertRef.value = true; 
   if (window.LucidifyBindRenderViewState) {
     window.LucidifyBindRenderViewState({
       maxViewSpanSecRef:   { get value() { return maxViewSpanSec; },   set value(v) { maxViewSpanSec = v; } },
@@ -141,6 +146,7 @@ window.addEventListener("DOMContentLoaded", () => {
       spectrogramMaxHzRef: { get value() { return spectrogramMaxHz; }, set value(v) { spectrogramMaxHz = v; } },
       editingFreqRef:      { get value() { return editingFreq; },      set value(v) { editingFreq = v; } },
       freqRangeLabelRef:   { get value() { return freqRangeLabel; } },
+	  flipSecondChannelVertRef,
     });
   }
 
@@ -525,7 +531,7 @@ async function renderHypnogramFromSelection() {
   }
 //------------------------------------------------------------------------------------------
   function stageToY(stage) {
-    // Matches your label order W, REM, N1, N2, N3 (top -> bottom)
+    // Matches label order W, REM, N1, N2, N3 (top -> bottom)
     if (stage === "W") return 0;
     if (stage === "REM") return 1;
     if (stage === "N1") return 2;
@@ -843,17 +849,25 @@ async function renderHypnogramFromSelection() {
         spectrogramMaxHz = Math.min(Math.max(val, 1), nyquist);
       }
 
-      freqRangeLabel.textContent =
-        `Freq: 0–${spectrogramMaxHz.toFixed(1)} Hz`;
+		const shownMax = (spectrogramMaxHz == null) ? nyquist : spectrogramMaxHz;
+		freqRangeLabel.textContent = `Freq: 0–${shownMax.toFixed(1)} Hz`;
 
-      if (lastRecording) {
-        drawSpectrogram(
-          spectrogramCtx,
-          spectrogramCanvas,
-          lastRecording,
-          spectrogramVisible
-        );
-      }
+	  if (lastRecording) {
+	    (async () => {
+		  setSectionLoading(spectrogramSection, true);
+		  await nextPaint(); // lets overlay render before heavy work
+		  try {
+		    drawSpectrogram(
+		  	spectrogramCtx,
+		  	spectrogramCanvas,
+		  	lastRecording,
+		  	spectrogramVisible
+		    );
+		  } finally {
+		    setSectionLoading(spectrogramSection, false);
+		  }
+	    })();
+	  }  
     }
 
     input.addEventListener("keydown", (ev) => {

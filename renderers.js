@@ -24,6 +24,7 @@
   let spectrogramMaxHzRef = { value: null };
   let editingFreqRef = { value: false };
   let freqRangeLabelRef = { value: null };
+  let flipSecondChannelVertRef = { value: true };
 
   function bindViewState(opts) {
     maxViewSpanSecRef   = opts.maxViewSpanSecRef;
@@ -32,6 +33,7 @@
     spectrogramMaxHzRef = opts.spectrogramMaxHzRef;
     editingFreqRef      = opts.editingFreqRef;
     freqRangeLabelRef   = opts.freqRangeLabelRef;
+	flipSecondChannelVertRef = opts.flipSecondChannelVertRef || flipSecondChannelVertRef;
   }
 
   function resizeCanvasToDisplaySize(canvas) {
@@ -121,7 +123,7 @@
 
       const samplesPerPixel = nSamples / width;
 
-      ctx.strokeStyle = "#0f0";
+      ctx.strokeStyle = "#aaa";
       ctx.beginPath();
 
       for (let x = 0; x < width; x++) {
@@ -198,6 +200,36 @@
       }
     }
   }
+function robustMinMaxFromSpecs(specs, framesPerChannel, maxBin, loP = 0.02, hiP = 0.98) {
+  const samples = [];
+  for (let ci = 0; ci < specs.length; ci++) {
+    const specRows = specs[ci];
+    const nFrames = framesPerChannel[ci] || 0;
+    if (!specRows || nFrames <= 0) continue;
+
+    // Sample sparsely for speed
+    const frameStep = Math.max(1, Math.floor(nFrames / 200));
+    const freqStep  = Math.max(1, Math.floor(maxBin / 128));
+
+    for (let f = 0; f < nFrames; f += frameStep) {
+      const row = specRows[f];
+      for (let k = 0; k <= maxBin; k += freqStep) {
+        const v = row[k];
+        if (Number.isFinite(v)) samples.push(v);
+      }
+    }
+  }
+
+  if (samples.length < 16) return [0, 1];
+
+  samples.sort((a, b) => a - b);
+  const lo = samples[Math.floor(loP * (samples.length - 1))];
+  const hi = samples[Math.floor(hiP * (samples.length - 1))];
+
+  // Avoid degenerate ranges
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [samples[0], samples[samples.length - 1]];
+  return [lo, hi];
+}
 
   function hotColdColor(norm) {
     let t = norm;
@@ -241,8 +273,9 @@
     let spectrogramMaxHz = spectrogramMaxHzRef.value;
     const editingFreq    = editingFreqRef.value;
     const freqRangeLabel = freqRangeLabelRef.value;
-
+    const flipSecondChannelVert = !!flipSecondChannelVertRef.value;
     const indices = [];
+
     for (let i = 0; i < channels.length; i++) {
       if (!visible || visible[i]) indices.push(i);
     }
@@ -257,6 +290,15 @@
 
     const width = canvas.width;
     const height = canvas.height;
+
+// Internal left gutter for labels (does not change canvas element size)
+const labelGutterPx = 34;
+const xOffset = labelGutterPx;
+const drawW = Math.max(1, width - xOffset);
+
+// Create image buffer once
+const imageData = ctx.createImageData(width, height);
+const data = imageData.data;
     const maxChannelsToDraw = 8;
     const nChannels = Math.min(indices.length, maxChannelsToDraw);
     const channelHeight = height / nChannels;
@@ -348,9 +390,12 @@
         Math.floor((effectiveMaxHz / nyquist) * (nFreq - 1))
       )
     );
+// After maxBin is computed:
+const [scaleMin, scaleMax] = robustMinMaxFromSpecs(specs, framesPerChannel, maxBin, 0.02, 0.98);
+const invRange = 1 / Math.max(1e-9, (scaleMax - scaleMin));
 
-    const imageData = ctx.createImageData(width, height);
-    const data = imageData.data;
+// Optional: gamma > 1 darkens mid-tones (less green), gamma < 1 brightens them
+const gamma = 1.4;
 
     for (let ci = 0; ci < nChannels; ci++) {
       const specRows = specs[ci];
@@ -364,34 +409,76 @@
         const y = yStart + yLocal;
         if (y >= height) break;
 
-        const freqFrac = 1 - yLocal / Math.max(1, chHeight - 1);
-        const freqIndex = Math.min(maxBin, Math.floor(freqFrac * maxBin));
+		const denom = Math.max(1, chHeight - 1);
+		const frac01 = yLocal / denom;
 
-        for (let x = 0; x < width; x++) {
-          const tFrac = x / Math.max(1, width - 1);
-          const frameIndex = Math.min(nFrames - 1, Math.floor(tFrac * nFrames));
-          const val = specRows[frameIndex][freqIndex];
+		// Normal: top=high (your current behavior). Flipped: top=low (second channel only).
+		const freqFrac = (flipSecondChannelVert && ci === 1) ? frac01 : (1 - frac01);
+		const freqIndex = Math.min(maxBin, Math.floor(freqFrac * maxBin));
 
-          let norm = (val - globalMin) / (globalMax - globalMin);
-          if (!Number.isFinite(norm)) norm = 0;
+for (let x = 0; x < width; x++) {
 
-          let r, g, b;
-          if (norm > 1.0) {
-            r = g = b = 255;
-          } else {
-            [r, g, b] = hotColdColor(norm);
-          }
+  // Left gutter: just paint black (or leave whatever background you want)
+  if (x < xOffset) {
+    const idx = (y * width + x) * 4;
+    data[idx + 0] = 0;
+    data[idx + 1] = 0;
+    data[idx + 2] = 0;
+    data[idx + 3] = 255;
+    continue;
+  }
 
-          const idx = (y * width + x) * 4;
-          data[idx + 0] = r;
-          data[idx + 1] = g;
-          data[idx + 2] = b;
-          data[idx + 3] = 255;
-        }
+  const tFrac = (x - xOffset) / Math.max(1, drawW - 1);
+  const frameIndex = Math.min(nFrames - 1, Math.floor(tFrac * nFrames));
+  const val = specRows[frameIndex][freqIndex];
+
+  let norm = (val - scaleMin) * invRange;
+  norm = Math.max(0, Math.min(1, norm));
+  norm = Math.pow(norm, gamma);
+  if (!Number.isFinite(norm)) norm = 0;
+
+  let r, g, b;
+  if (norm > 1.0) {
+    r = g = b = 255;
+  } else {
+    [r, g, b] = hotColdColor(norm);
+  }
+
+  const idx = (y * width + x) * 4;
+  data[idx + 0] = r;
+  data[idx + 1] = g;
+  data[idx + 2] = b;
+  data[idx + 3] = 255;
+}
+
       }
     }
 
     ctx.putImageData(imageData, 0, 0);
+	// Draw frequency labels in the left gutter (after image so text sits on top)
+ctx.save();
+ctx.fillStyle = "#fff";
+ctx.font = "10px system-ui";
+ctx.textAlign = "right";
+
+for (let ci = 0; ci < nChannels; ci++) {
+  const yStart = Math.floor(ci * channelHeight);
+  const chHeight = Math.floor(channelHeight);
+  const isFlipped = (flipSecondChannelVert && ci === 1);
+
+  // Labels reflect what's actually at the top/bottom of the image
+  const topHz = isFlipped ? 0 : effectiveMaxHz;
+  const botHz = isFlipped ? effectiveMaxHz : 0;
+
+  ctx.textBaseline = "top";
+  ctx.fillText(`${topHz.toFixed(0)} Hz`, xOffset - 2, yStart + 2);
+
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`${botHz.toFixed(0)} Hz`, xOffset - 2, yStart + chHeight - 2);
+}
+
+ctx.restore();
+
   }
 
   // Export
