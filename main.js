@@ -120,7 +120,7 @@ window.addEventListener("DOMContentLoaded", () => {
   
   let isPanning = false;
   
-  
+  let lastHypnogramResult = null;
 
   // Bind EDF parser and renderers from separate modules
   const parseEdf = window.LucidifyParseEdf;
@@ -154,7 +154,97 @@ flipSecondChannelVertRef.value = true;
     console.error("DOM not wired correctly");
     return;
   }
+  ///CSV EXPORT helpers
+  function stageLabelToCode(lbl) {
+    // YASA-style mapping commonly used for AASM 5-class staging
+    // W=0, N1=1, N2=2, N3=3, REM=4
+    if (lbl === "W") return 0;
+    if (lbl === "N1") return 1;
+    if (lbl === "N2") return 2;
+    if (lbl === "N3") return 3;
+    if (lbl === "REM") return 4;
+    return -1;
+  }
   
+  function downloadTextFile(filename, text, mime = "text/csv;charset=utf-8") {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+  
+  function hypnoToCsv(stages, probs, opts) {
+    const {
+      epochSec = 30,
+      windowStartSec = 0,
+      fileName = "recording",
+      model = "unknown",
+      hmmApplied = false,
+    } = (opts || {});
+  
+    const startEpoch = Math.floor(windowStartSec / epochSec);
+  
+    // Header
+    const cols = [
+      "file",
+      "model",
+      "hmm",
+      "epoch_sec",
+      "window_start_sec",
+      "abs_epoch",
+      "rel_epoch",
+      "t0_sec",
+      "stage_label",
+      "stage_code",
+    ];
+  
+    const hasProbs = Array.isArray(probs) && probs.length === stages.length && Array.isArray(probs[0]);
+    if (hasProbs) cols.push("p_W", "p_N1", "p_N2", "p_N3", "p_REM");
+  
+    const lines = [cols.join(",")];
+  
+    for (let i = 0; i < stages.length; i++) {
+      const lbl = stages[i];
+      const code = stageLabelToCode(lbl);
+      const absEpoch = startEpoch + i;
+      const t0 = windowStartSec + i * epochSec;
+  
+      const row = [
+        JSON.stringify(fileName),
+        JSON.stringify(model),
+        hmmApplied ? "1" : "0",
+        String(epochSec),
+        String(windowStartSec),
+        String(absEpoch),
+        String(i),
+        String(t0),
+        JSON.stringify(lbl),
+        String(code),
+      ];
+  
+      if (hasProbs) {
+        const p = probs[i];
+        // probs order in your code is labels=["W","N1","N2","N3","REM"]
+        row.push(
+          String(p[0] ?? ""),
+          String(p[1] ?? ""),
+          String(p[2] ?? ""),
+          String(p[3] ?? ""),
+          String(p[4] ?? "")
+        );
+      }
+  
+      lines.push(row.join(","));
+    }
+  
+    return lines.join("\n");
+  }
+
   // --- UI / state helpers ------------------------------------------------
   function setSectionLoading(sectionEl, isLoading) {
     if (!sectionEl) return;
@@ -210,6 +300,7 @@ function ensureHypnogramModelSelector() {
   
       <button id="hypnogram-load-ref" type="button" title="Load a reference hypnogram (EDF/TSV)">Load Ref</button>
       <button id="hypnogram-clear-ref" type="button" title="Clear reference overlay">Clear Ref</button>
+      <button id="hypnogram-export-csv" type="button" title="Download hypnogram as CSV">Download CSV</button>
       <input id="hypnogram-ref-input" type="file" accept=".edf,.tsv" style="display:none" />
     </div>
   `;
@@ -277,6 +368,33 @@ function ensureHypnogramModelSelector() {
       setSectionLoading(hypnogramSection, false);
     }
   });
+  const exportBtn = wrap.querySelector("#hypnogram-export-csv");
+
+  exportBtn?.addEventListener("click", () => {
+    if (!lastHypnogramResult?.stagesDraw?.length) {
+      alert("No hypnogram computed yet. Render the hypnogram first.");
+      return;
+    }
+  
+    const r = lastHypnogramResult;
+  
+    const base = (r.fileName || "recording").replace(/\.[^.]+$/, "");
+    const model = r.model || "model";
+    const hmm = r.hmmApplied ? "hmm" : "raw";
+    const start = (r.windowStartSecUsed ?? 0).toFixed(2).replace(".", "p");
+    const fn = `${base}_${model}_${hmm}_start_${start}s_hypno.csv`;
+  
+    const csv = hypnoToCsv(r.stagesDraw, r.probs, {
+      epochSec: r.epochSec,
+      windowStartSec: r.windowStartSecUsed,
+      fileName: r.fileName,
+      model: r.model,
+      hmmApplied: r.hmmApplied,
+    });
+  
+    downloadTextFile(fn, csv);
+  });
+
 }
 
 function getSelectedHypnogramModelUrl() {
@@ -506,7 +624,20 @@ async function renderHypnogramFromSelection() {
       const labels = ["W", "N1", "N2", "N3", "REM"];
       stagesToDraw = viterbiSmoothSleepStages(probs, labels);
     }
-  
+    const selectedModel =
+    document.querySelector('input[name="hypnogram-model"]:checked')?.value || "physio";
+
+    lastHypnogramResult = {
+      stagesRaw: stages,
+      stagesDraw: stagesToDraw,
+      probs: probs,
+      epochSec: 30,
+      windowStartSecUsed: windowStartSecUsed,
+      model: selectedModel,
+      hmmApplied: !!(document.getElementById("hypnogram-hmm-checkbox")?.checked),
+      fileName: lastFileName || "recording",
+    };
+    
     window.renderHypnogramStep(hypnogramCanvas, stagesToDraw, { leftMargin: 80 });
     
     if (referenceHypno?.stages?.length) {
