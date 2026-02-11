@@ -330,7 +330,10 @@
       const file = this._currentFile;
       const info = this._headerInfo;
       if (!file || !info) return;
-
+      // Use full EDF duration instead of default 300s when dialog opens
+      if (this._durationInput && Number.isFinite(info.durationSec) && info.durationSec > 0) {
+        this._durationInput.value = Math.floor(info.durationSec).toString();
+      }
       const mb = (file.size / (1024 * 1024)).toFixed(1);
       this._infoText.textContent =
         `File: ${file.name} (${mb} MB), duration: ${info.durationSec.toFixed(1)} s, ` +
