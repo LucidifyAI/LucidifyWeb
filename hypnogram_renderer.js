@@ -140,6 +140,20 @@ function renderHypnogramStep(canvas, stages, options = {}) {
   ctx.beginPath();
 
   function yForStage(stage) {
+    // Normalize stage into canonical strings used by this renderer.
+    // Accepts numeric ids (0..4) and YASA's "R".
+    if (typeof stage === "number") {
+      // 0=W,1=N1,2=N2,3=N3,4=REM
+      stage = (stage === 0) ? "W"
+        : (stage === 1) ? "N1"
+        : (stage === 2) ? "N2"
+        : (stage === 3) ? "N3"
+        : (stage === 4) ? "REM"
+        : "W";
+    } else if (stage === "R") {
+      stage = "REM";
+    }
+  
     const level = stageToLevel.has(stage) ? stageToLevel.get(stage) : stageToLevel.get("W");
     return plotTop + level * dy;
   }
