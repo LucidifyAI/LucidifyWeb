@@ -301,7 +301,7 @@ function ensureHypnogramModelSelector() {
       <button id="hypnogram-load-ref" type="button" title="Load a reference hypnogram (EDF/TSV)">Load Ref</button>
       <button id="hypnogram-clear-ref" type="button" title="Clear reference overlay">Clear Ref</button>
       <button id="hypnogram-export-csv" type="button" title="Download hypnogram as CSV">Download CSV</button>
-      <input id="hypnogram-ref-input" type="file" accept=".edf,.tsv" style="display:none" />
+      <input id="hypnogram-ref-input" type="file" accept=".edf,.tsv,.csv" style="display:none" />
     </div>
   `;
   hypnogramControls.prepend(wrap);
@@ -339,18 +339,26 @@ function ensureHypnogramModelSelector() {
 		  totalDurationSec: Number(lastRecording?.durationSec) || null,
 		});
       referenceHypno.sourceName = f.name;
-    } else if (nameLower.endsWith(".tsv")) {
-		const tsvText = new TextDecoder("utf-8").decode(new Uint8Array(buf));
-	referenceHypno = window.HYPNO_REF.parseBidsEventsTsvToHypnogram(tsvText, {
-	epochSec: 30,
-	totalDurationSec: lastRecording?.durationSec,
-	fs: lastRecording?.channels?.[0]?.fs, // if you want begsample alignment
-	preferSamples: true,
-	// stageColumn: "stage_hum", // optional override
-	sourceName: f.name,
-	});
-    } else {
-      throw new Error("Unsupported ref hypnogram format (use .edf or .tsv).");
+        } else if (nameLower.endsWith(".tsv")) {
+      const tsvText = new TextDecoder("utf-8").decode(new Uint8Array(buf));
+      referenceHypno = window.HYPNO_REF.parseBidsEventsTsvToHypnogram(tsvText, {
+        epochSec: 30,
+        totalDurationSec: lastRecording?.durationSec,
+        fs: lastRecording?.channels?.[0]?.fs,
+        preferSamples: true,
+      });
+      referenceHypno.sourceName = f.name;
+
+    } else if (nameLower.endsWith(".csv")) {
+      const csvText = new TextDecoder("utf-8").decode(new Uint8Array(buf));
+      referenceHypno = window.HYPNO_REF.parseStagesCsvToHypnogram(csvText, {
+        epochSec: 30,
+        totalDurationSec: lastRecording?.durationSec,
+        sourceName: f.name,
+      });
+      referenceHypno.sourceName = f.name;
+	} else {
+      throw new Error("Unsupported ref hypnogram format (use .csv, .edf or .tsv).");
     }
     if (!lastRecording) return;
     setSectionLoading(hypnogramSection, true);

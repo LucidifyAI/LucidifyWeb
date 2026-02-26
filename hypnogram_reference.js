@@ -322,38 +322,155 @@ function parseBidsEventsTsvToHypnogram(tsvText, opts = {}) {
 
   return { epochSec, stages, sourceName };
 }
-  function compareStages(pred, ref) {
-    const labels = ["W", "N1", "N2", "N3", "REM"];
-    const idx = new Map(labels.map((l, i) => [l, i]));
-    const K = labels.length;
-  
-    let N = 0, agree = 0;
-    const cm = Array.from({ length: K }, () => new Array(K).fill(0));
-  
-    for (let i = 0; i < Math.min(pred.length, ref.length); i++) {
-      const a = pred[i], b = ref[i];
-      if (!idx.has(a) || !idx.has(b)) continue; // skip null/unknown/movement
-      const ia = idx.get(a), ib = idx.get(b);
-      cm[ia][ib] += 1;
-      N++;
-      if (ia === ib) agree++;
+  //---------------------------------------------------------------------------
+//-----ParseStagesCsvToHypnogram---------------------------------------------
+// Accepts common "stages CSV" formats from Python exports.
+//
+// Supported shapes:
+//  A) header row with a stage column: stage|stages|sleep_stage|y_pred|pred|stg
+//     optionally with index/epoch column(s)
+//  B) no header, single column of labels (W,N1,N2,N3,R/REM) one per epoch
+//  C) two columns: (epoch,index) , stage
+//
+// Returns: { epochSec, stages, sourceName }
+function parseStagesCsvToHypnogram(csvText, opts = {}) {
+  const epochSec = opts.epochSec ?? 30;
+  const totalDurationSecOpt = Number.isFinite(opts.totalDurationSec) ? opts.totalDurationSec : null;
+  const sourceName = opts.sourceName || "";
+
+  const text = String(csvText || "").replace(/\r/g, "");
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l.length);
+  if (lines.length === 0) return { epochSec, stages: [], sourceName };
+
+  // Basic CSV split (no quoted commas). Good enough for stage labels exports.
+  const splitCsv = (line) => line.split(",").map(x => String(x).trim());
+
+  const normalizeStage = (raw) => {
+    if (raw == null) return null;
+    const s = String(raw).trim();
+    if (!s || s === "n/a" || s === "NA") return null;
+
+    const up = s.toUpperCase();
+    if (up === "W" || up === "WAKE") return "W";
+    if (up === "R" || up === "REM") return "REM";
+    if (up === "N1" || up === "1") return "N1";
+    if (up === "N2" || up === "2") return "N2";
+    if (up === "N3" || up === "3" || up === "N4" || up === "4") return "N3";
+
+    const n = parseInt(s, 10);
+    if (Number.isFinite(n)) {
+      if (n === 0) return "W";
+      if (n === 1) return "N1";
+      if (n === 2) return "N2";
+      if (n === 3) return "N3";
+      if (n === 4) return "REM";
     }
-  
-    const acc = N ? (agree / N) : 0;
-  
-    // Cohen’s kappa
-    let pe = 0;
-    if (N) {
-      const row = cm.map(r => r.reduce((s, v) => s + v, 0));
-      const col = Array.from({ length: K }, (_, j) => cm.reduce((s, r) => s + r[j], 0));
-      for (let k = 0; k < K; k++) pe += (row[k] / N) * (col[k] / N);
+    return null;
+  };
+
+  // Detect header vs data
+  const first = splitCsv(lines[0]);
+  const looksLikeHeader = first.some(h => /[a-zA-Z_]/.test(h));
+  const stageColCandidates = ["stage", "stages", "sleep_stage", "y_pred", "pred", "stg", "stage_ai", "stage_hum"];
+
+  let startLine = 0;
+  let stageCol = -1;
+
+  if (looksLikeHeader && lines.length >= 2) {
+    const header = first.map(h => h.toLowerCase());
+    for (const nm of stageColCandidates) {
+      const i = header.indexOf(nm);
+      if (i >= 0) { stageCol = i; break; }
     }
-    const kappa = (N && (1 - pe) > 1e-12) ? ((acc - pe) / (1 - pe)) : 0;
-  
-    return { N, acc, kappa, cm, labels };
+    startLine = 1;
+
+    // If header exists but we didn't find a named column, fall back to "last column"
+    if (stageCol < 0) stageCol = header.length - 1;
   }
+
+  const stages = [];
+  for (let li = startLine; li < lines.length; li++) {
+    const row = splitCsv(lines[li]);
+    if (row.length === 0) continue;
+
+    let rawStage = null;
+
+    if (stageCol >= 0 && stageCol < row.length) {
+      rawStage = row[stageCol];
+    } else if (row.length === 1) {
+      rawStage = row[0];
+    } else if (row.length >= 2) {
+      // Common: epoch/index in col0, stage in col1 (or last col)
+      rawStage = row[1] ?? row[row.length - 1];
+    }
+
+    const st = normalizeStage(rawStage);
+    stages.push(st);
+  }
+
+  // If caller provided a target duration, pad/truncate to that length
+  if (Number.isFinite(totalDurationSecOpt) && totalDurationSecOpt > 0) {
+    const wantEpochs = Math.ceil(totalDurationSecOpt / epochSec);
+    if (stages.length < wantEpochs) {
+      const need = wantEpochs - stages.length;
+      for (let i = 0; i < need; i++) stages.push(null);
+    } else if (stages.length > wantEpochs) {
+      stages.length = wantEpochs;
+    }
+  }
+
+  return { epochSec, stages, sourceName };
+}
+
+//---------------------------------------------------------------------------
+//-----CompareStages---------------------------------------------------------
+// Normalizes "R" -> "REM" etc so Python/JS label sets compare cleanly.
+function compareStages(pred, ref) {
+  const normalize = (s) => {
+    if (s == null) return null;
+    const up = String(s).trim().toUpperCase();
+    if (up === "R") return "REM";
+    if (up === "WAKE") return "W";
+    if (up === "1") return "N1";
+    if (up === "2") return "N2";
+    if (up === "3" || up === "4") return "N3";
+    return (up === "W" || up === "N1" || up === "N2" || up === "N3" || up === "REM") ? up : null;
+  };
+
+  const labels = ["W", "N1", "N2", "N3", "REM"];
+  const idx = new Map(labels.map((l, i) => [l, i]));
+  const K = labels.length;
+
+  let N = 0, agree = 0;
+  const cm = Array.from({ length: K }, () => new Array(K).fill(0));
+
+  for (let i = 0; i < Math.min(pred.length, ref.length); i++) {
+    const a = normalize(pred[i]);
+    const b = normalize(ref[i]);
+    if (!idx.has(a) || !idx.has(b)) continue;
+    const ia = idx.get(a), ib = idx.get(b);
+    cm[ia][ib] += 1;
+    N++;
+    if (ia === ib) agree++;
+  }
+
+  const acc = N ? (agree / N) : 0;
+
+  // Cohen’s kappa
+  let pe = 0;
+  if (N) {
+    const row = cm.map(r => r.reduce((s, v) => s + v, 0));
+    const col = Array.from({ length: K }, (_, j) => cm.reduce((s, r) => s + r[j], 0));
+    for (let k = 0; k < K; k++) pe += (row[k] / N) * (col[k] / N);
+  }
+  const kappa = (N && (1 - pe) > 1e-12) ? ((acc - pe) / (1 - pe)) : 0;
+
+  return { N, acc, kappa, cm, labels };
+}
+
 window.HYPNO_REF = {
   parseSleepEdfHypnogramFromArrayBuffer,
   parseBidsEventsTsvToHypnogram,
+  parseStagesCsvToHypnogram,
   compareStages
 };

@@ -382,8 +382,8 @@
   function extractChannelFeatures(epochs, fs, epochSec, chType, dsp) {
     const T = epochs.length;
 
-    const winSec = Math.min(5, epochSec);
-    const nperseg = Math.floor(winSec * fs);
+const winSec = Math.min(5, epochSec);   // back to 5s window
+const nperseg = Math.floor(winSec * fs); // at fs=100 => 500
 
     // output feature columns per epoch in a fixed order
     const baseNames = ["std", "iqr", "skew", "kurt", "nzc", "hmob", "hcomp"];
@@ -401,7 +401,20 @@
 
     for (let t = 0; t < T; t++) {
       const ep = epochs[t];
+if (t === 0 || t === 10 || t === 100) {
+  let mu = 0;
+  for (let i = 0; i < ep.length; i++) mu += ep[i];
+  mu /= ep.length;
 
+  let s2 = 0;
+  for (let i = 0; i < ep.length; i++) {
+    const d = ep[i] - mu;
+    s2 += d * d;
+  }
+  const std = Math.sqrt(s2 / Math.max(1, ep.length - 1));
+
+  console.log(`JS t=${t} epMean=${mu} epStd=${std} epLen=${ep.length}`);
+}
       const row = new Float64Array(D);
       let j = 0;
 
@@ -420,20 +433,41 @@
       let bandPowers = null;
       let totalBroad = null;
 
-      if (chType !== "emg") {
-        const { freqs, psd } = dsp.welchMedianPSD(ep, fs, nperseg);
+if (chType !== "emg") {
+  const { freqs, psd } = dsp.welchMedianPSD(ep, fs, nperseg);
 
-        // Broad-band absolute power 0.4–30
-        totalBroad = dsp.trapzBand(psd, freqs, 0.4, 30.0);
+  // Broad-band absolute power 0.4–30
+  totalBroad = dsp.trapzBand(psd, freqs, 0.4, 30.0);
 
-        bandPowers = {};
-        for (const [f0, f1, nm] of BANDS_DEFAULT) {
-          const bp = dsp.trapzBand(psd, freqs, f0, f1);
-          bandPowers[nm] = (totalBroad > 0) ? (bp / totalBroad) : 0; // relative band power
-        }
+  bandPowers = {};
+  let sdeltaAbs = 0;
+  let fdeltaAbs = 0;
 
-        for (const nm of bandNames) row[j++] = bandPowers[nm];
-      }
+  for (const [f0, f1, nm] of BANDS_DEFAULT) {
+    const bpAbs = dsp.trapzBand(psd, freqs, f0, f1);
+
+    if (nm === "sdelta") sdeltaAbs = bpAbs;
+    if (nm === "fdelta") fdeltaAbs = bpAbs;
+
+    bandPowers[nm] = (totalBroad > 0) ? (bpAbs / totalBroad) : 0; // relative band power
+  }
+
+  // DEBUG: compare delta bands vs Python for a few epochs
+  if (t === 0 || t === 10 || t === 100) {
+    const deltaAbs = sdeltaAbs + fdeltaAbs;
+    const sdeltaRel = bandPowers["sdelta"];
+    const fdeltaRel = bandPowers["fdelta"];
+    const deltaRel = sdeltaRel + fdeltaRel;
+
+    console.log(
+      `JS t=${t} absPow_0p4_30=${totalBroad} ` +
+      `sdeltaAbs=${sdeltaAbs} fdeltaAbs=${fdeltaAbs} deltaAbs=${deltaAbs} ` +
+      `sdeltaRel=${sdeltaRel} fdeltaRel=${fdeltaRel} deltaRel=${deltaRel}`
+    );
+  }
+
+  for (const nm of bandNames) row[j++] = bandPowers[nm];
+}
 
       // ratios for EEG only
       if (chType === "eeg") {
@@ -558,20 +592,24 @@
 
       finalMat[t] = row;
     }
-
+    var sort = true;
     // sort feature names lexicographically (LightGBM convention) :contentReference[oaicite:9]{index=9}
-    const sortedNames = sortFeatureNames(finalNames);
-    const nameToIdx = new Map(finalNames.map((n, i) => [n, i]));
+	if(sort){
+		const sortedNames = sortFeatureNames(finalNames);
+		const nameToIdx = new Map(finalNames.map((n, i) => [n, i]));
 
-    const sortedMat = new Array(T);
-    for (let t = 0; t < T; t++) {
-      const src = finalMat[t];
-      const dst = new Float64Array(sortedNames.length);
-      for (let i = 0; i < sortedNames.length; i++) dst[i] = src[nameToIdx.get(sortedNames[i])];
-      sortedMat[t] = dst;
-    }
+		const sortedMat = new Array(T);
+		for (let t = 0; t < T; t++) {
+		  const src = finalMat[t];
+		  const dst = new Float64Array(sortedNames.length);
+		  for (let i = 0; i < sortedNames.length; i++) dst[i] = src[nameToIdx.get(sortedNames[i])];
+		  sortedMat[t] = dst;
+		}
 
-    return { featureNames: sortedNames, X: sortedMat };
+		return { featureNames: sortedNames, X: sortedMat };
+	}else{
+		return { featureNames: finalNames, X: finalMat };
+	}
   }
 
   window.YASA_FEATURES = { buildFeatureTable };
