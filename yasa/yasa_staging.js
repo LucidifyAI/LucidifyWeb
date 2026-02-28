@@ -109,6 +109,28 @@ const emgP = emg ? await preprocessSignal(emg, fs, dsp) : null;
     metadata,
     dsp
   );
+  // --- DEBUG EXPORT: capture exact features going into the model ---
+window.__LUCIDIFY_YASA_DEBUG_LAST = {
+  meta: {
+    fsIn,
+    fs: 100,
+    epochSec,
+    nEpoch: X.length,
+    nFeat: featureNames.length,
+  },
+  featureNames: featureNames.slice(),
+  // Keep it light: first N rows + a few targeted rows
+  sampleRows: {
+    0: Array.from(X[0]),
+    10: Array.from(X[10]),
+    100: Array.from(X[100]),
+  }
+};
+
+// If you want FULL export (big!), toggle this manually:
+if (window.__LUCIDIFY_YASA_EXPORT_FULL === true) {
+  window.__LUCIDIFY_YASA_DEBUG_LAST.X = X.map(r => Array.from(r));
+}
 function statsAndHash(tag, x, fs, nSec = 30) {
   const n = Math.min(x.length, Math.floor(fs * nSec));
   let s = 0, s2 = 0, mn = Infinity, mx = -Infinity;
