@@ -155,17 +155,29 @@ flipSecondChannelVertRef.value = true;
     return;
   }
   ///CSV EXPORT helpers
-  function stageLabelToCode(lbl) {
-    // YASA-style mapping commonly used for AASM 5-class staging
-    // W=0, N1=1, N2=2, N3=3, REM=4
-    if (lbl === "W") return 0;
-    if (lbl === "N1") return 1;
-    if (lbl === "N2") return 2;
-    if (lbl === "N3") return 3;
-    if (lbl === "REM") return 4;
-    return -1;
+
+// Model output class index -> stage label string.
+// IMPORTANT: must match your JS model's class order.
+const YASA_STAGE_CLASSES = ["N1", "N2", "N3", "R", "W"];
+
+function stageIndexToLabel(v) {
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return YASA_STAGE_CLASSES[v] ?? "UNK";
   }
-  
+  return String(v ?? "UNK");
+}
+
+function stageLabelToCode(lblOrIdx) {
+  const lbl = stageIndexToLabel(lblOrIdx);
+
+  // CSV code mapping (AASM-ish 5-class)
+  if (lbl === "W")  return 0;
+  if (lbl === "N1") return 1;
+  if (lbl === "N2") return 2;
+  if (lbl === "N3") return 3;
+  if (lbl === "R" || lbl === "REM") return 4;
+  return -1;
+}
   function downloadTextFile(filename, text, mime = "text/csv;charset=utf-8") {
     const blob = new Blob([text], { type: mime });
     const url = URL.createObjectURL(blob);
@@ -203,29 +215,35 @@ flipSecondChannelVertRef.value = true;
       "stage_code",
     ];
   
-    const hasProbs = Array.isArray(probs) && probs.length === stages.length && Array.isArray(probs[0]);
+	const hasProbs =
+	  probs &&
+	  probs.length === stages.length &&
+	  probs[0] != null &&
+	  typeof probs[0].length === "number";
     if (hasProbs) cols.push("p_W", "p_N1", "p_N2", "p_N3", "p_REM");
   
     const lines = [cols.join(",")];
   
-    for (let i = 0; i < stages.length; i++) {
-      const lbl = stages[i];
-      const code = stageLabelToCode(lbl);
-      const absEpoch = startEpoch + i;
-      const t0 = windowStartSec + i * epochSec;
-  
-      const row = [
-        JSON.stringify(fileName),
-        JSON.stringify(model),
-        hmmApplied ? "1" : "0",
-        String(epochSec),
-        String(windowStartSec),
-        String(absEpoch),
-        String(i),
-        String(t0),
-        JSON.stringify(lbl),
-        String(code),
-      ];
+	for (let i = 0; i < stages.length; i++) {
+	  const raw = stages[i];
+	  const lblStr = stageIndexToLabel(raw);
+	  const code = stageLabelToCode(raw);
+
+	  const absEpoch = startEpoch + i;
+	  const t0 = windowStartSec + i * epochSec;
+
+	  const row = [
+		JSON.stringify(fileName),
+		JSON.stringify(model),
+		hmmApplied ? "1" : "0",
+		String(epochSec),
+		String(windowStartSec),
+		String(absEpoch),
+		String(i),
+		String(t0),
+		JSON.stringify(lblStr),   // <-- write string label, not raw number
+		String(code),
+	  ];
   
       if (hasProbs) {
         const p = probs[i];
@@ -235,7 +253,7 @@ flipSecondChannelVertRef.value = true;
           String(p[1] ?? ""),
           String(p[2] ?? ""),
           String(p[3] ?? ""),
-          String(p[4] ?? "")
+          String(p[4] ?? ""),
         );
       }
   
@@ -554,7 +572,7 @@ async function renderHypnogramFromSelection() {
     if (!lastRecording) return;
     console.log("rendering hypnogram from selection");
     ensureHypnogramModelSelector();
-  
+
     resizeCanvasToDisplaySize(hypnogramCanvas);
     hypnogramCanvas.height = 160;
     const ctx = hypnogramCanvas.getContext("2d");
@@ -567,8 +585,56 @@ async function renderHypnogramFromSelection() {
     if (indices.length === 0) return;
   
     const merged = mergeChannels(lastRecording, indices);
+if (!merged || !merged.samples || merged.samples.length === 0) {
+  console.warn("Hypno: selected merged channel empty — falling back to first non-empty channel.");
+  // pick first non-empty channel and rebuild merged
+  const fallbackIdx = pickDefaultHypnoIndex(lastRecording.channels);
+  if (fallbackIdx !== undefined && fallbackIdx >= 0) {
+    // reset selection UI (so user sees change)
+    hypnogramVisible = hypnogramVisible.map((v,i)=> i===fallbackIdx);
+    // merge that single channel
+    const fb = mergeChannels(lastRecording, [fallbackIdx]);
+    if (fb && fb.samples && fb.samples.length > 0) {
+      windowSamplesNative = sliceView(fb.samples, fb.fs);
+      windowSamplesV = normalizeToVolts(windowSamplesNative, fb.physDim);
+    } else {
+      throw new Error("Fallback hypnogram channel has no samples.");
+    }
+  } else {
+    throw new Error("No non-empty channel available for hypnogram.");
+  }
+}
     const fs = merged.fs;
-    
+    // --- debug probe: why are we getting zero-length epochs? ---
+console.group("DEBUG: hypno inputs");
+try {
+  console.log("lastFileName:", lastFileName);
+  console.log("viewStartSec, viewDurationSec:", viewStartSec, viewDurationSec);
+  console.log("selected hypnogram indices:", indices);
+  console.log("lastRecording.durationSec:", lastRecording?.durationSec);
+
+  (lastRecording.channels || []).forEach((ch, i) => {
+    console.log(
+      `chan[${i}] name='${ch?.name}' physDim='${ch?.physDim}' fs=${ch?.fs} samples_len=${ch?.samples?.length ?? "null"}`
+    );
+  });
+
+  console.log(
+    "merged.samples_len:", merged?.samples?.length ?? "null",
+    "merged.fs:", merged?.fs,
+    "merged.physDim:", merged?.physDim
+  );
+
+  const epochSamp = Math.floor(30 * fs);
+  console.log("epochSamp(30s):", epochSamp);
+
+  const slicedLen = sliceView(merged.samples, fs).length;
+  console.log("sliceView(merged).length:", slicedLen);
+} catch (e) {
+  console.error("DEBUG probe failed:", e);
+} finally {
+  console.groupEnd();
+}
     // Keep original units for YASA
     const samplesNative_full = merged.samples;      // in merged.physDim (often µV)
     // Keep volts for Lucidify LR models
@@ -672,7 +738,7 @@ async function renderHypnogramFromSelection() {
   function stageToY(stage) {
     // Matches label order W, REM, N1, N2, N3 (top -> bottom)
     if (stage === "W") return 0;
-    if (stage === "REM") return 1;
+	if (stage === "R" || stage === "REM") return 1;
     if (stage === "N1") return 2;
     if (stage === "N2") return 3;
     if (stage === "N3") return 4;
@@ -733,7 +799,16 @@ async function renderHypnogramFromSelection() {
   }
 
   // --- Channel visibility controls --------------------------------------
-
+function pickDefaultHypnoIndex(channels) {
+  const eegUnits = /^(uV|µV|uv|mv|v)$/i;
+  const badName = /annot|annotation|event|marker/i;
+  let idx = channels.findIndex(c => c?.samples?.length > 0 && eegUnits.test((c.physDim||"")));
+  if (idx >= 0) return idx;
+  idx = channels.findIndex(c => c?.samples?.length > 0 && !badName.test((c.name||"")));
+  if (idx >= 0) return idx;
+  idx = channels.findIndex(c => c?.samples?.length > 0);
+  return idx >= 0 ? idx : 0;
+}
   /**
    * Rebuild the checkboxes for wave/spectrogram visibility.
    * @param {Recording} recording

@@ -91,9 +91,15 @@ async function stageYASA(opts) {
   if (!dsp || !feats || !lgbm) throw new Error("Missing YASA modules (DSP, FEATURES, LGBM)");
 
   // --- preprocess (same as before) ---
-  const eegP = preprocessSignal(eeg, fs, dsp);
-  const eogP = eog ? preprocessSignal(eog, fs, dsp) : null;
-  const emgP = emg ? preprocessSignal(emg, fs, dsp) : null;
+const eegP = await preprocessSignal(eeg, fs, dsp);
+console.log("stageYASA preprocess:", {
+  fsIn: fs,
+  eeg_in_len: eeg?.length ?? null,
+  eegP_len: eegP?.length ?? null,
+  eegP_type: eegP?.constructor?.name ?? typeof eegP,
+});
+const eogP = eog ? await preprocessSignal(eog, fs, dsp) : null;
+const emgP = emg ? await preprocessSignal(emg, fs, dsp) : null;
 
   // --- feature extraction (same as before) ---
   let { featureNames, X } = feats.buildFeatureTable(
@@ -123,16 +129,30 @@ function statsAndHash(tag, x, fs, nSec = 30) {
   console.log(`${tag} fs=${fs} n=${n} mean=${mean} std=${std} min=${mn} max=${mx} chk=${chk}`);
 }
 
-function preprocessSignal(x, fsIn, dsp) {
-  const x64 = toFloat64Array(x);
+function isThenable(v) {
+  return v != null && (typeof v === "object" || typeof v === "function") && typeof v.then === "function";
+}
+async function maybeAwait(v) {
+  return isThenable(v) ? await v : v;
+}
 
-  const xr = dsp.resampleTo100Hz(x64, fsIn);
-  statsAndHash("JS RESAMPLED epoch0", xr, 100, 30);
+// REPLACE the old preprocessSignal with this async version:
+async function preprocessSignal(x, fsIn, dsp) {
+  if (!x || x.length === 0) return new Float64Array(0);
 
-  const xf = dsp.bandpassFIR_04_30_zeroPhase(xr, 100);
-  statsAndHash("JS BANDPASS epoch0", xf, 100, 30);
+  x = toFloat64Array(x);
 
-  return xf;
+  // resample -> 100 Hz (sync or async)
+  let x100 = await maybeAwait(dsp.resampleTo100Hz(x, fsIn));
+  if (!x100) return new Float64Array(0);
+  if (!(x100 instanceof Float64Array)) x100 = Float64Array.from(x100);
+
+  // bandpass 0.4–30 (sync or async)
+  let xbp = await maybeAwait(dsp.bandpass_04_30(x100, 100.0));
+  if (!xbp) return new Float64Array(0);
+  if (!(xbp instanceof Float64Array)) xbp = Float64Array.from(xbp);
+
+  return xbp;
 }
 
 	statsAndHash("JS RAW EEG epoch0", eeg, fs, 30);

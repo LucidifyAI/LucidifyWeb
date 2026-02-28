@@ -300,31 +300,36 @@
     return w;
   }
 
-  function rollingTriangCentered(matrix /* [T][D] */, L /*15*/) {
-    const T = matrix.length;
-    const D = matrix[0].length;
-    const w = triangWeights(L);
-    const mid = (L - 1) >> 1;
+	function rollingTriangCentered(matrix /* [T][D] */, L /*15*/) {
+		if (!Array.isArray(matrix) || matrix.length === 0) {
+			throw new Error(`rollingTriangCentered: empty matrix (T=${matrix?.length ?? "null"})`);
+		}
+		if (matrix[0] == null || typeof matrix[0].length !== "number") {
+			throw new Error(`rollingTriangCentered: matrix[0] invalid (${Object.prototype.toString.call(matrix[0])})`);
+		}
+		const T = matrix.length;
+		const D = matrix[0].length;
+		const w = triangWeights(L);
+		const mid = (L - 1) >> 1;
 
-    const out = new Array(T);
-    for (let t = 0; t < T; t++) {
-      const row = new Float64Array(D);
-      for (let d = 0; d < D; d++) {
-        let acc = 0, wsum = 0;
-        for (let k = 0; k < L; k++) {
-          const tt = t + (k - mid);
-          if (tt < 0 || tt >= T) continue;
-          const wk = w[k];
-          acc += matrix[tt][d] * wk;
-          wsum += wk;
-        }
-        row[d] = acc / (wsum || 1);
-      }
-      out[t] = row;
-    }
-    return out;
-  }
-
+		const out = new Array(T);
+		for (let t = 0; t < T; t++) {
+			const row = new Float64Array(D);
+			for (let d = 0; d < D; d++) {
+				let acc = 0, wsum = 0;
+				for (let k = 0; k < L; k++) {
+					const tt = t + (k - mid);
+					if (tt < 0 || tt >= T) continue;
+					const wk = w[k];
+					acc += matrix[tt][d] * wk;
+					wsum += wk;
+				}
+				row[d] = acc / (wsum || 1);
+			}
+			out[t] = row;
+		}
+		return out;
+	}
   function rollingPastMean(matrix /* [T][D] */, L /*4*/) {
     const T = matrix.length;
     const D = matrix[0].length;
@@ -366,9 +371,30 @@
     return Array.from(names).sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)));
   }
 
-  function windowEpochs(x, fs, epochSec) {
-    const nPer = Math.floor(fs * epochSec);
-    const nEpoch = Math.floor(x.length / nPer);
+function windowEpochs(x /* Float64Array */, fs, epochSec) {
+  if (!x || !Number.isFinite(x.length)) {
+    console.error("windowEpochs: x is null/invalid", x);
+    return [];
+  }
+  if (!Number.isFinite(fs) || fs <= 0) {
+    console.error("windowEpochs: fs invalid", fs);
+    return [];
+  }
+  if (!Number.isFinite(epochSec) || epochSec <= 0) {
+    console.error("windowEpochs: epochSec invalid", epochSec);
+    return [];
+  }
+
+  const nPer = Math.floor(fs * epochSec);
+  const nEpoch = Math.floor(x.length / nPer);
+
+  console.log(
+    "windowEpochs:",
+    { fs, epochSec, xLen: x.length, nPer, nEpoch }
+  );
+
+  if (nEpoch <= 0) return [];
+
     const epochs = new Array(nEpoch);
     for (let e = 0; e < nEpoch; e++) {
       const start = e * nPer;
@@ -513,7 +539,14 @@ if (chType !== "emg") {
     const chEpochs = chOrder.map(([type, arr]) => [type, windowEpochs(arr, fs, epochSec)]);
 
     const T = chEpochs[0][1].length;
-
+if (!Number.isFinite(T) || T <= 0) {
+  const eegLen = signals?.eeg?.[0]?.length ?? null;
+  const eogLen = signals?.eog?.[0]?.length ?? null;
+  const emgLen = signals?.emg?.[0]?.length ?? null;
+  throw new Error(
+    `buildFeatureTable: 0 epochs. lens eeg=${eegLen} eog=${eogLen} emg=${emgLen} epochSec=${epochSec} fs=${fs}`
+  );
+}
     // per-channel feature matrices
     const feats = [];
     for (const [type, epochs] of chEpochs) {
