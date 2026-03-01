@@ -112,7 +112,7 @@ const emgP = emg ? await preprocessSignal(emg, fs, dsp) : null;
   // --- DEBUG EXPORT: capture exact features going into the model ---
 window.__LUCIDIFY_YASA_DEBUG_LAST = {
   meta: {
-    fsIn,
+    fsIn:fs,
     fs: 100,
     epochSec,
     nEpoch: X.length,
@@ -188,6 +188,32 @@ async function preprocessSignal(x, fsIn, dsp) {
   // --- pack features into the model's expected order right before inference ---
   const modelFeatureNames = dump.feature_names || dump.featureNames;
   ({ featureNames, X } = packToModelFeatureOrder(featureNames, X, modelFeatureNames));
+  window.__LUCIDIFY_YASA_DEBUG_PACKED = {
+  featureNames: featureNames.slice(),
+  X: (window.__LUCIDIFY_YASA_EXPORT_FULL === true) ? X.map(r => Array.from(r)) : undefined
+};
+// === EXPORT PACKED FEATURES (model order) ===
+window.__LUCIDIFY_YASA_DEBUG_PACKED = {
+  meta: {
+    fsIn: fs,
+    fs: 100,
+    epochSec,
+    nEpoch: X.length,
+    nFeat: featureNames.length,
+  },
+  featureNames: featureNames.slice(),
+  sampleRows: {
+    0: Array.from(X[0]),
+    10: X.length > 10 ? Array.from(X[10]) : undefined,
+    100: X.length > 100 ? Array.from(X[100]) : undefined,
+  }
+};
+
+// If the user explicitly wants the full matrix (big!), toggle this in console before running:
+if (window.__LUCIDIFY_YASA_EXPORT_FULL === true) {
+  // convert Float64Array rows to plain arrays for JSON/CSV friendliness
+  window.__LUCIDIFY_YASA_DEBUG_PACKED.X = X.map((r) => Array.from(r));
+}
 // === Epoch-alignment debug: compare time_hour / time_norm across JS vs Python ===
 (function logTimeFeatures() {
   const idxHour = featureNames.indexOf("time_hour");

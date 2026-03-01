@@ -233,46 +233,59 @@
     return rank;
   }
 
-  function higuchiFD(x, kmax = 10) {
-    const N = x.length;
-    if (N < (kmax + 2)) return 1;
+ function higuchiFD(x, kmax = 10) {
+  // Match the mne-features / entropy (Vallat) implementation used by YASA/antropy.
+  // Key differences vs our old version:
+  // - n_max = floor((N - m - 1) / k)
+  // - sum over j = 1..(n_max-1)
+  // - ll /= k
+  // - ll *= (N - 1) / (k * n_max)
+  // - regression x = log(1/k), y = log(mean_lm)
 
-    const L = new Float64Array(kmax);
-    for (let k = 1; k <= kmax; k++) {
-      let LkSum = 0;
-      for (let m = 0; m < k; m++) {
-        let len = 0;
-        let count = 0;
-        for (let i = m + k; i < N; i += k) {
-          len += Math.abs(x[i] - x[i - k]);
-          count++;
-        }
-        if (count > 0) {
-          const norm = (N - 1) / (count * k);
-          LkSum += (len * norm);
-        }
+  const N = x.length;
+  if (N < (kmax + 2)) return 1;
+
+  const lk = new Float64Array(kmax);
+  const xReg = new Float64Array(kmax);
+  const yReg = new Float64Array(kmax);
+
+  for (let k = 1; k <= kmax; k++) {
+    let mLm = 0;
+
+    for (let m = 0; m < k; m++) {
+      const nMax = Math.floor((N - m - 1) / k);
+      if (nMax <= 0) continue;
+
+      let ll = 0;
+      for (let j = 1; j < nMax; j++) {
+        const a = x[m + j * k];
+        const b = x[m + (j - 1) * k];
+        ll += Math.abs(a - b);
       }
-      L[k - 1] = LkSum / k;
+
+      ll /= k;
+      ll *= (N - 1) / (k * nMax);
+      mLm += ll;
     }
 
-    // Fit log(L(k)) vs log(1/k) slope
-    const xs = new Float64Array(kmax);
-    const ys = new Float64Array(kmax);
-    for (let i = 0; i < kmax; i++) {
-      xs[i] = Math.log(1 / (i + 1));
-      ys[i] = Math.log(L[i] || 1e-12);
-    }
+    mLm /= k;
+    lk[k - 1] = mLm;
 
-    // simple linear regression slope
-    let sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (let i = 0; i < kmax; i++) {
-      const xi = xs[i], yi = ys[i];
-      sx += xi; sy += yi; sxx += xi * xi; sxy += xi * yi;
-    }
-    const denom = (kmax * sxx - sx * sx) || 1;
-    const slope = (kmax * sxy - sx * sy) / denom;
-    return slope;
+    xReg[k - 1] = Math.log(1.0 / k);
+    yReg[k - 1] = Math.log(mLm || 1e-12);
   }
+
+  // Linear regression slope of yReg on xReg
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let i = 0; i < kmax; i++) {
+    const xi = xReg[i], yi = yReg[i];
+    sx += xi; sy += yi; sxx += xi * xi; sxy += xi * yi;
+  }
+  const denom = (kmax * sxx - sx * sx) || 1;
+  const slope = (kmax * sxy - sx * sy) / denom;
+
+  return slope;
+}
 
   function petrosianFD(x) {
     const N = x.length;
@@ -461,7 +474,26 @@ if (t === 0 || t === 10 || t === 100) {
 
 if (chType !== "emg") {
   const { freqs, psd } = dsp.welchMedianPSD(ep, fs, nperseg);
+// --- Parseval sanity check (compare PSD integral vs time-domain variance) ---
+if (t === 0 || t === 10 || t === 100) {
+  const df = freqs[1] - freqs[0];
+  let total = 0;
+  for (let i = 0; i < psd.length; i++) total += psd[i];
 
+  // time-domain variance (ddof=0, like numpy.var default)
+  let mu = 0;
+  for (let i = 0; i < ep.length; i++) mu += ep[i];
+  mu /= ep.length;
+
+  let v = 0;
+  for (let i = 0; i < ep.length; i++) {
+    const d = ep[i] - mu;
+    v += d * d;
+  }
+  v /= ep.length;
+
+  console.log(`JS t=${t} PSD_int=${total * df} var=${v} ratio=${(total * df) / (v || 1)}`);
+}
   // Broad-band absolute power 0.4–30
   totalBroad = dsp.trapzBand(psd, freqs, 0.4, 30.0);
 

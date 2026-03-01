@@ -404,6 +404,18 @@ return { freqs, pxx: pxxMed, nperseg, K };
     }
     return s;
   }
+  function bandpowerFromPxx_pythonStyle(freqs, pxx, fmin, fmax) {
+  const df = freqs[1] - freqs[0];
+  let s = 0;
+
+  for (let i = 0; i < freqs.length; i++) {
+    if (freqs[i] >= fmin && freqs[i] <= fmax) {
+      s += pxx[i];
+    }
+  }
+
+  return s * df;
+}
 //---------------------------------------------------------------------------------
 function sinc(x) {
   if (x === 0) return 1;
@@ -908,7 +920,7 @@ welchMedianPSD: (epoch, fs, nperseg) => {
   const { freqs, pxx } = welchMedian(epoch, fs, { nperseg });
   return { freqs, psd: pxx };
 },
-    trapzBand: (psd, freqs, f0, f1) => bandpowerFromPxx(freqs, psd, f0, f1),
+    trapzBand: (psd, freqs, f0, f1) => bandpowerFromPxx_pythonStyle(freqs, psd, f0, f1),
   
     // also expose originals (optional)
     _downsampleTo: downsampleTo,
