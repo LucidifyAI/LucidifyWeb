@@ -1,266 +1,397 @@
 import json
 import re
 import time
-from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import mne
-from scipy.signal import welch
+from scipy.signal import welch, fftconvolve
 
-
-# ------------------------- CONFIG -------------------------
-
+# -----------------------------
+# CONFIG (edit these)
+# -----------------------------
 EDF_PATH = r"C:\Users\ryan\Downloads\Patientcode_Firstname_1_2_26_18_6_57_to_2_2_26_2_8_44.edf"
 EEG_CH = "Fp1"
 
-# Point this at your local file; keep the same name if you like.
-YASA_DSP_JS_PATH = r"yasa_dsp.js"
-
-# Your exported JS epoch (already in uV, fs=100)
-JS_EPOCH_PATH = r"js_epoch0_signal.json"
+JS_EPOCH_JSON = "js_epoch0_signal.json"     # must contain {"fs": 100, "signal": [...]}
+YASA_DSP_JS_PATH = "yasa_dsp.js"            # taps live here
 
 EPOCH_SEC = 30
-FS_TARGET = 100.0
-N_PER_SEG = 500  # 5 sec @ 100 Hz
-OVERLAP = N_PER_SEG // 2
+WELCH_NPERSEG = 500                         # 5 sec at 100 Hz
+WELCH_WINDOW = "hamming"
 
-
-# ------------------------- UTIL: JS taps extraction -------------------------
-
-_FLOAT_RE = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?"
-
-def _extract_first_taps_array(js_text: str) -> np.ndarray:
+# -----------------------------
+# JS-matching FIR helpers
+# -----------------------------
+def _js_fir_convolve_same(x: np.ndarray, taps: np.ndarray) -> np.ndarray:
     """
-    Find the first occurrence of `taps: [ ... ]` in a JS object literal and parse floats.
-    This is robust to whitespace/newlines and ignores other numeric fields.
+    Matches yasa_dsp.js __firConvolveSame:
+      y[i] = sum_{k=0..m-1} x[i + k - half] * taps[k], with zero outside bounds.
+    This equals standard convolution with taps reversed, mode='same'.
     """
-    m = re.search(r"\btaps\s*:\s*\[([\s\S]*?)\]", js_text)
-    if not m:
-        raise RuntimeError("Could not find any `taps: [ ... ]` array in the JS file.")
-    body = m.group(1)
-    nums = re.findall(_FLOAT_RE, body)
-    if not nums:
-        raise RuntimeError("Found `taps: [...]` but could not parse any floats.")
-    return np.array([float(x) for x in nums], dtype=np.float64)
+    # fftconvolve does standard convolution; to match JS formula we reverse taps.
+    return fftconvolve(x, taps[::-1], mode="same")
 
+def _js_filtfilt_fir_reflect_same(x: np.ndarray, taps: np.ndarray) -> np.ndarray:
+    """
+    Matches yasa_dsp.js __filtfiltFIR_reflectSame:
+      pad = min(n-1, 3*(m-1))
+      xpad = [reflect-left] + x + [reflect-right]
+      y = fir_same(xpad, taps)
+      y = reverse(y); y = fir_same(y, taps); y = reverse(y)
+      return y[pad:pad+n]
+    """
+    x = np.asarray(x, dtype=np.float64)
+    taps = np.asarray(taps, dtype=np.float64)
+
+    n = x.size
+    m = taps.size
+    if n == 0:
+        return x.copy()
+    if m < 2:
+        return x.copy()
+
+    pad = min(n - 1, 3 * (m - 1))
+    if pad <= 0:
+        # Degenerate case
+        y = _js_fir_convolve_same(x, taps)
+        y = _js_fir_convolve_same(y[::-1], taps)[::-1]
+        return y
+
+    xpad = np.empty(n + 2 * pad, dtype=np.float64)
+
+    # left reflect: x[pad], x[pad-1], ..., x[1]
+    # (this matches the JS loop xpad[i] = x[pad - i])
+    for i in range(pad):
+        xpad[i] = x[pad - i]
+
+    xpad[pad:pad + n] = x
+
+    # right reflect: x[n-2], x[n-3], ..., x[n-1-pad]
+    # (this matches xpad[pad+n+i] = x[n-2-i])
+    for i in range(pad):
+        xpad[pad + n + i] = x[n - 2 - i]
+
+    y = _js_fir_convolve_same(xpad, taps)
+    y = _js_fir_convolve_same(y[::-1], taps)[::-1]
+
+    return y[pad:pad + n].copy()
+
+# -----------------------------
+# Robust taps extraction
+# -----------------------------
 def load_mne_fir_taps_from_js(js_path: str) -> np.ndarray:
     """
-    Preferred: specifically pull taps for the MNE 0.4–30 @ 100 Hz kernel if present.
-    Fallback: pull the first `taps: [...]` array in the file.
+    Extract FIR taps array from yasa_dsp.js.
+
+    Supports either:
+      const __MNE_FIR_0P4_30_FS100__ = { ... taps: [ ... ] ... };
+    or:
+      const MNE_FIR_0P4_30_FS100 = { ... taps: [ ... ] ... };
+
+    Critically: only parses numbers *inside the taps [ ... ]* block.
     """
     with open(js_path, "r", encoding="utf-8") as f:
         txt = f.read()
 
-    # 1) Try to target the exact object name you actually have in yasa_dsp.js:
-    #    const __MNE_FIR_0P4_30_FS100__ = { ... taps: [ ... ] }
-    target = "__MNE_FIR_0P4_30_FS100__"
-    m = re.search(
-        rf"const\s+{re.escape(target)}\s*=\s*\{{([\s\S]*?)\}}\s*;",
-        txt
-    )
-    if m:
-        obj_body = m.group(1)
-        taps = _extract_first_taps_array("taps: [" + obj_body.split("taps:", 1)[1].split("]", 1)[0] + "]")
-        return taps
+    # Find whichever object name exists
+    obj_names = ["__MNE_FIR_0P4_30_FS100__", "MNE_FIR_0P4_30_FS100"]
+    obj_body = None
+    for name in obj_names:
+        m_obj = re.search(
+            rf"const\s+{re.escape(name)}\s*=\s*\{{([\s\S]*?)\}}\s*;",
+            txt
+        )
+        if m_obj:
+            obj_body = m_obj.group(1)
+            break
+    if obj_body is None:
+        raise RuntimeError(f"Could not locate FIR object in {js_path} (tried {obj_names})")
 
-    # 2) Try legacy patterns people often used:
-    #    __MNE_FIR_0P4_30_FS100__ Float64Array([ ... ])
-    m = re.search(r"__MNE_FIR_0P4_30_FS100__\s*=\s*new\s+Float64Array\s*\(\s*\[([\s\S]*?)\]\s*\)", txt)
-    if m:
-        nums = re.findall(_FLOAT_RE, m.group(1))
-        if not nums:
-            raise RuntimeError("Matched Float64Array([...]) but no floats parsed.")
-        return np.array([float(x) for x in nums], dtype=np.float64)
+    m_taps = re.search(r"\btaps\s*:\s*\[([\s\S]*?)\]", obj_body)
+    if not m_taps:
+        raise RuntimeError(f"Could not find taps: [ ... ] inside FIR object in {js_path}")
 
-    # 3) Fallback: first taps array anywhere
-    return _extract_first_taps_array(txt)
+    taps_body = m_taps.group(1)
+    nums = re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", taps_body)
+    taps = np.array([float(x) for x in nums], dtype=np.float64)
+
+    if taps.size != 825:
+        raise RuntimeError(f"Expected 825 taps, got {taps.size}. First6={taps[:6].tolist()}")
+
+    return taps
 
 
-# ------------------------- UTIL: JS-style DSP -------------------------
-
-def decimate_by_5_take_every_5th(x: np.ndarray) -> np.ndarray:
-    n = (x.size // 5)
-    return x[: n * 5 : 5].copy()
-
-def fir_convolve_same_zero(x: np.ndarray, h: np.ndarray) -> np.ndarray:
+def sanity_check_taps(taps: np.ndarray) -> None:
     """
-    Match JS firConvolve():
-      y[i] = sum_k h[k] * x[i + k - half], with x out-of-bounds treated as 0.
-    This is equivalent to 'same' convolution with zero padding.
+    Reject obviously broken tap vectors early.
     """
-    x = np.asarray(x, dtype=np.float64)
-    h = np.asarray(h, dtype=np.float64)
-    m = h.size
-    half = (m - 1) // 2
+    if not np.isfinite(taps).all():
+        raise RuntimeError("Taps contain NaN/Inf")
 
-    # zero-pad
-    xp = np.pad(x, (half, half), mode="constant", constant_values=0.0)
-    y = np.convolve(xp, h, mode="valid")  # length == len(x)
-    return y.astype(np.float64, copy=False)
+    # MNE FIR taps are tiny (~1e-3-ish max). A '825' here means corruption.
+    max_abs = float(np.max(np.abs(taps)))
+    if max_abs > 1.0:
+        raise RuntimeError(f"Taps look corrupted (max|tap|={max_abs}). Did we accidentally include num_taps?")
 
-def filtfilt_fir_zero_pad(x: np.ndarray, h: np.ndarray) -> np.ndarray:
-    """
-    Match JS filtfiltFIR_zeroPad():
-      y1 = firConvolve(x, h)
-      y2 = firConvolve(reverse(y1), h)
-      return reverse(y2)
-    """
-    y1 = fir_convolve_same_zero(x, h)
-    y2 = fir_convolve_same_zero(y1[::-1], h)
-    return y2[::-1]
+    # Bandpass taps should have near-zero DC gain => sum near ~0 (not exactly 0).
+    s = float(np.sum(taps))
+    if abs(s) > 0.5:
+        raise RuntimeError(f"Taps sum is suspicious (sum={s}). Likely wrong array extracted.")
 
-
-# ------------------------- IO helpers -------------------------
-
-@dataclass
-class JsEpoch:
-    signal_uv: np.ndarray
-    fs: float
-
-def load_js_epoch(path: str) -> JsEpoch:
-    with open(path, "r", encoding="utf-8") as f:
-        j = json.load(f)
-    sig = np.asarray(j["signal"], dtype=np.float64)
-    fs = float(j["fs"])
-    return JsEpoch(signal_uv=sig, fs=fs)
-
-def read_edf_channel_uv(edf_path: str, ch_name: str) -> tuple[np.ndarray, float]:
-    raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR").pick([ch_name])
-    fs_in = float(raw.info["sfreq"])
-    x_v = raw.get_data()[0]        # volts
-    x_uv = x_v * 1e6               # microvolts
-    return np.asarray(x_uv, dtype=np.float64), fs_in
-
-
-# ------------------------- Compare metrics -------------------------
-
-def corr(a: np.ndarray, b: np.ndarray) -> float:
+# -----------------------------
+# Utilities
+# -----------------------------
+def compare_signals(a: np.ndarray, b: np.ndarray, label: str):
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
-    if a.size != b.size:
-        raise ValueError("corr(): lengths differ")
-    if a.size < 2:
-        return float("nan")
-    return float(np.corrcoef(a, b)[0, 1])
+    n = min(a.size, b.size)
+    a = a[:n]
+    b = b[:n]
 
-def rmse(a: np.ndarray, b: np.ndarray) -> float:
-    d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
-    return float(np.sqrt(np.mean(d * d)))
+    corr = float(np.corrcoef(a, b)[0, 1]) if n > 1 else float("nan")
+    rmse = float(np.sqrt(np.mean((a - b) ** 2))) if n else float("nan")
+    mad = float(np.max(np.abs(a - b))) if n else float("nan")
 
-def max_abs(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.max(np.abs(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64))))
+    print(f"\n=== Compare: {label} ===")
+    print("len a/b", a.size, b.size)
+    print("var a/b", float(np.var(a)), float(np.var(b)))
+    print("mean a/b", float(np.mean(a)), float(np.mean(b)))
+    print("signal corr:", corr)
+    print("signal rmse:", rmse)
+    print("signal max abs diff:", mad)
+    print("first16 a:", a[:16])
+    print("first16 b:", b[:16])
 
-def summarize_epoch(tag: str, epoch_py: np.ndarray, epoch_js: np.ndarray) -> None:
-    print(f"\n=== Compare: {tag} (PY) vs JS epoch ===")
-    print("len py/js", len(epoch_py), len(epoch_js))
-    print("var py/js", float(np.var(epoch_py, ddof=0)), float(np.var(epoch_js, ddof=0)))
-    print("signal corr:", corr(epoch_py, epoch_js))
-    print("signal rmse:", rmse(epoch_py, epoch_js))
-    print("signal max abs diff:", max_abs(epoch_py, epoch_js))
-    print("first16 py:", epoch_py[:16])
-    print("first16 js:", epoch_js[:16])
-
-def summarize_psd(tag: str, epoch_py: np.ndarray, epoch_js: np.ndarray, fs: float, out_json: str) -> None:
-    freqs, psd_py = welch(
-        epoch_py,
+def welch_psd(x: np.ndarray, fs: float):
+    freqs, psd = welch(
+        x,
         fs=fs,
-        window="hamming",
-        nperseg=N_PER_SEG,
-        noverlap=OVERLAP,
+        window=WELCH_WINDOW,
+        nperseg=WELCH_NPERSEG,
+        noverlap=WELCH_NPERSEG // 2,
         detrend="constant",
         return_onesided=True,
         scaling="density",
         average="median",
     )
-    freqs2, psd_js = welch(
-        epoch_js,
-        fs=fs,
-        window="hamming",
-        nperseg=N_PER_SEG,
-        noverlap=OVERLAP,
-        detrend="constant",
-        return_onesided=True,
-        scaling="density",
-        average="median",
-    )
+    dx = freqs[1] - freqs[0]
+    p_int = float(np.sum(psd) * dx)
+    return freqs, psd, dx, p_int
+    
+def best_lag(a: np.ndarray, b: np.ndarray, max_lag: int = 400) -> int:
+    """
+    Find lag in samples (a shifted relative to b) that maximizes correlation.
+    Searches [-max_lag, +max_lag].
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    n = min(len(a), len(b))
+    a = a[:n] - np.mean(a[:n])
+    b = b[:n] - np.mean(b[:n])
 
-    dx = float(freqs[1] - freqs[0])
-    psd_int_py = float(np.sum(psd_py) * dx)
-    psd_int_js = float(np.sum(psd_js) * dx)
+    best = 0
+    best_r = -1.0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            aa = a[-lag:]
+            bb = b[:len(aa)]
+        elif lag > 0:
+            bb = b[lag:]
+            aa = a[:len(bb)]
+        else:
+            aa = a
+            bb = b
+        if len(aa) < 200:
+            continue
+        r = float(np.corrcoef(aa, bb)[0, 1])
+        if r > best_r:
+            best_r = r
+            best = lag
+    print(f"best lag = {best} samples, corr={best_r}")
+    return best
+    
+def best_lag_corr(a: np.ndarray, b: np.ndarray, max_lag: int = 200):
+    """
+    Find lag (in samples) maximizing correlation between a and b.
+    Positive lag means 'a' should be shifted right (a[lag:] vs b[:-lag]).
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    n = min(len(a), len(b))
+    a = a[:n] - np.mean(a[:n])
+    b = b[:n] - np.mean(b[:n])
 
-    print(f"\n--- PSD stage: {tag} ---")
-    print("df", dx)
-    print("freqs[:10]", freqs[:10])
-    print("PSD_int py", psd_int_py)
-    print("PSD_int js", psd_int_js)
-    print("ratio py", psd_int_py / (float(np.var(epoch_py, ddof=0)) or 1.0))
-    print("ratio js", psd_int_js / (float(np.var(epoch_js, ddof=0)) or 1.0))
+    best_lag = 0
+    best_corr = -1e9
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            aa = a[lag:]
+            bb = b[:len(aa)]
+        else:
+            bb = b[-lag:]
+            aa = a[:len(bb)]
+        if len(aa) < 100:
+            continue
+        c = np.corrcoef(aa, bb)[0, 1]
+        if c > best_corr:
+            best_corr = float(c)
+            best_lag = lag
+    return best_lag, best_corr
+    
+def best_lag_by_corr(a: np.ndarray, b: np.ndarray, max_lag: int = 200):
+    """
+    Find lag (in samples) to apply to 'a' so that a_shifted aligns best with b.
+    lag > 0 means shift a forward: a_shifted = a[lag:lag+n]
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    n = min(a.size, b.size)
+
+    best = (None, -1.0)
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            aa = a[lag:lag+n]
+            bb = b[:aa.size]
+        else:
+            aa = a[:n+lag]
+            bb = b[-lag:-lag+aa.size]
+        if aa.size < 10:
+            continue
+        c = float(np.corrcoef(aa, bb)[0, 1])
+        if c > best[1]:
+            best = (lag, c)
+    return best  # (lag, corr)
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    t0 = time.time()
+
+    # Load JS epoch
+    with open(JS_EPOCH_JSON, "r") as f:
+        j = json.load(f)
+    epoch_js = np.array(j["signal"], dtype=np.float64)
+    fs_js = float(j["fs"])
+    print(f"Loaded JS epoch: len={epoch_js.size} fs={fs_js}")
+
+    # Read EDF
+    print("Reading EDF (this can take a moment)...")
+    t = time.time()
+    raw = mne.io.read_raw_edf(EDF_PATH, preload=True, verbose="ERROR").pick([EEG_CH])
+    fs_in = float(raw.info["sfreq"])
+    x_v = raw.get_data()[0]      # volts
+    x_uv = x_v * 1e6             # microvolts
+    print(f"EDF loaded: fs_in={fs_in}, samples={x_uv.size}, elapsed={time.time()-t:.2f}s")
+
+    # Downsample 500 -> 100 by integer /5 (match the JS diagnostic path)
+    if abs(fs_in / 5.0 - 100.0) < 1e-6:
+        print("Downsampling to 100.0 Hz...")
+        t = time.time()
+        x_ds = x_uv[::5].copy()
+        fs = fs_in / 5.0
+        print(f"Downsample done: samples={x_ds.size}, fs={fs}, elapsed={time.time()-t:.2f}s")
+    else:
+        raise RuntimeError(f"Expected fs_in=500 for /5 downsample, got fs_in={fs_in}")
+
+    n_epoch = int(fs_js * EPOCH_SEC)
+    if n_epoch != epoch_js.size:
+        print(f"Warning: JS epoch length {epoch_js.size} != expected {n_epoch}; using min.")
+        n_epoch = min(n_epoch, epoch_js.size)
+
+    epoch_resample_only = x_ds[:n_epoch]
+    compare_signals(epoch_resample_only, epoch_js[:n_epoch], "resample-only (PY) vs JS epoch")
+
+    # Load taps and run JS-style filtfilt
+    taps = load_mne_fir_taps_from_js(YASA_DSP_JS_PATH)
+    sanity_check_taps(taps)
+    print("Loaded taps:", len(taps), "first5:", taps[:5])
+
+    print("Bandpass 0.4–30 using JS taps via filtfilt...")
+    t = time.time()
+    x_bp = _js_filtfilt_fir_reflect_same(x_ds, taps)
+    print(f"Filter done: samples={x_bp.size}, elapsed={time.time()-t:.2f}s")
+
+    epoch_bp = x_bp[:n_epoch]
+    compare_signals(epoch_bp, epoch_js[:n_epoch], "resample+FIR bandpass (PY) vs JS epoch")
+    lag = best_lag(epoch_bp, epoch_js[:n_epoch], max_lag=400)
+    lag, c = best_lag_corr(epoch_bp, epoch_js[:n_epoch], max_lag=200)
+    print(f"best lag = {lag} samples, corr={c}")
+    # --- Find and APPLY lag on the bandpassed epoch ---
+    lag, cbest = best_lag_by_corr(epoch_bp, epoch_js[:n_epoch], max_lag=200)
+    print(f"best lag (apply to PY) = {lag} samples, corr={cbest}")
+
+    # Build aligned pair (same length)
+    if lag >= 0:
+        epoch_bp_aligned = x_bp[lag:lag + n_epoch].copy()
+        epoch_js_aligned = epoch_js[:epoch_bp_aligned.size].copy()
+    else:
+        epoch_bp_aligned = x_bp[:n_epoch + lag].copy()         # lag negative shortens
+        epoch_js_aligned = epoch_js[-lag:-lag + epoch_bp_aligned.size].copy()
+
+    compare_signals(epoch_bp_aligned, epoch_js_aligned, "bandpass (PY lag-aligned) vs JS epoch")
+    # Re-slice python epoch using lag so we compare the same 30s chunk
+    start = max(0, lag)
+    end = start + n_epoch
+    if end <= len(x_bp):
+        epoch_bp_aligned = x_bp[start:end]
+    else:
+        epoch_bp_aligned = epoch_bp  # fallback, shouldn't happen
+
+    compare_signals(epoch_bp_aligned, epoch_js[:n_epoch], "bandpass (PY aligned) vs JS epoch")
+
+    # And do Welch on epoch_bp_aligned (not epoch_bp)
+    freqs_bp, psd_bp, dx_bp, pint_bp = welch_psd(epoch_bp_aligned, fs_js)
+    # PSD comparisons
+    print("\n--- PSD stage: resample-only ---")
+    freqs_py, psd_py, dx_py, pint_py = welch_psd(epoch_resample_only, fs_js)
+    freqs_js, psd_js, dx_js, pint_js = welch_psd(epoch_js[:n_epoch], fs_js)
+    print("df", dx_py)
+    print("freqs[:10]", freqs_py[:10])
+    print("PSD_int py", pint_py)
+    print("PSD_int js", pint_js)
+    print("ratio py", float(pint_py / (np.var(epoch_resample_only) or 1.0)))
+    print("ratio js", float(pint_js / (np.var(epoch_js[:n_epoch]) or 1.0)))
     print("psd first10 py:", psd_py[:10])
     print("psd first10 js:", psd_js[:10])
     print("psd max abs diff:", float(np.max(np.abs(psd_py - psd_js))))
+    
+    print("\n--- PSD stage: resample+bandpass (LAG-ALIGNED) ---")
+    freqs_bp, psd_bp, dx_bp, pint_bp = welch_psd(epoch_bp_aligned, fs_js)
+    freqs_js2, psd_js2, dx_js2, pint_js2 = welch_psd(epoch_js_aligned, fs_js)
 
-    with open(out_json, "w", encoding="utf-8") as f:
+    print("df", dx_bp)
+    print("PSD_int py", pint_bp)
+    print("PSD_int js", pint_js2)
+    print("ratio py", float(pint_bp / (np.var(epoch_bp_aligned) or 1.0)))
+    print("ratio js", float(pint_js2 / (np.var(epoch_js_aligned) or 1.0)))
+    print("psd max abs diff:", float(np.max(np.abs(psd_bp - psd_js2))))
+    with open("py_vs_js_psd_resample_only.json", "w") as f:
         json.dump(
-            {
-                "fs": fs,
-                "nperseg": N_PER_SEG,
-                "noverlap": OVERLAP,
-                "freqs": freqs.tolist(),
-                "psd_py": psd_py.tolist(),
-                "psd_js": psd_js.tolist(),
-            },
-            f,
+            {"fs": fs_js, "freqs": freqs_py.tolist(), "psd_py": psd_py.tolist(), "psd_js": psd_js.tolist()},
+            f
         )
-    print(f"Wrote {out_json}")
+    print("Wrote py_vs_js_psd_resample_only.json")
 
+    print("\n--- PSD stage: resample+bandpass ---")
+    freqs_bp, psd_bp, dx_bp, pint_bp = welch_psd(epoch_bp, fs_js)
+    print("df", dx_bp)
+    print("freqs[:10]", freqs_bp[:10])
+    print("PSD_int py", pint_bp)
+    print("PSD_int js", pint_js)
+    print("ratio py", float(pint_bp / (np.var(epoch_bp) or 1.0)))
+    print("ratio js", float(pint_js / (np.var(epoch_js[:n_epoch]) or 1.0)))
+    print("psd first10 py:", psd_bp[:10])
+    print("psd first10 js:", psd_js[:10])
+    print("psd max abs diff:", float(np.max(np.abs(psd_bp - psd_js))))
+    with open("py_vs_js_psd_resample_bandpass.json", "w") as f:
+        json.dump(
+            {"fs": fs_js, "freqs": freqs_bp.tolist(), "psd_py": psd_bp.tolist(), "psd_js": psd_js.tolist()},
+            f
+        )
+    print("Wrote py_vs_js_psd_resample_bandpass.json")
 
-# ------------------------- MAIN -------------------------
-
-def main() -> None:
-    t0 = time.time()
-
-    taps = load_mne_fir_taps_from_js(YASA_DSP_JS_PATH)
-    print(f"Loaded taps: {len(taps)} first5:", taps[:5])
-
-    js = load_js_epoch(JS_EPOCH_PATH)
-    print(f"Loaded JS epoch: len={len(js.signal_uv)} fs={js.fs}")
-
-    print("Reading EDF (this can take a moment)...")
-    t_read = time.time()
-    x_uv_500, fs_in = read_edf_channel_uv(EDF_PATH, EEG_CH)
-    print(f"EDF loaded: fs_in={fs_in}, samples={len(x_uv_500)}, elapsed={time.time() - t_read:.2f}s")
-
-    if abs(fs_in - 500.0) > 1e-6:
-        raise RuntimeError(f"Expected EDF fs=500 Hz to match JS diagnostic path, got {fs_in}")
-
-    # epoch length @ target fs
-    n_epoch = int(FS_TARGET * EPOCH_SEC)
-
-    # --- Stage A: JS-style downsample only (take every 5th) ---
-    print(f"Downsampling to {FS_TARGET} Hz (integer /5)...")
-    t_ds = time.time()
-    x_ds = decimate_by_5_take_every_5th(x_uv_500)
-    print(f"Downsample done: samples={len(x_ds)}, fs={FS_TARGET}, elapsed={time.time() - t_ds:.2f}s")
-
-    epoch_ds = x_ds[:n_epoch].copy()
-    epoch_js = js.signal_uv[:n_epoch].copy()
-
-    summarize_epoch("resample-only", epoch_ds, epoch_js)
-
-    # --- Stage B: JS-style FIR filtfilt (zero-pad) using JS taps ---
-    print("Bandpass 0.4–30 using JS taps via filtfilt...")
-    t_bp = time.time()
-    x_bp = filtfilt_fir_zero_pad(x_ds, taps)
-    print(f"Filter done: samples={len(x_bp)}, elapsed={time.time() - t_bp:.2f}s")
-
-    epoch_bp = x_bp[:n_epoch].copy()
-
-    summarize_epoch("resample+FIR bandpass", epoch_bp, epoch_js)
-
-    summarize_psd("resample-only", epoch_ds, epoch_js, fs=FS_TARGET, out_json="py_vs_js_psd_resample_only.json")
-    summarize_psd("resample+bandpass", epoch_bp, epoch_js, fs=FS_TARGET, out_json="py_vs_js_psd_resample_bandpass.json")
-
-    print(f"\nTOTAL elapsed: {time.time() - t0:.2f}s")
+    print(f"\nTOTAL elapsed: {time.time()-t0:.2f}s")
 
 
 if __name__ == "__main__":
